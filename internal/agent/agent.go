@@ -699,6 +699,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 
 	// Add the session to the context.
 	ctx = context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
+	ctx = WithAPILogMetadata(ctx, APILogMetadata{
+		SessionID: call.SessionID,
+		RunID:     call.RunID,
+		Kind:      "agent_turn",
+	})
 
 	// For the accepted dispatch path the run context and cancel func
 	// were already created and registered under dispatchMu above; reuse
@@ -863,6 +868,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			callContext = context.WithValue(callContext, tools.MessageIDContextKey, assistantMsg.ID)
 			callContext = context.WithValue(callContext, tools.SupportsImagesContextKey, largeModel.CatwalkCfg.SupportsImages)
 			callContext = context.WithValue(callContext, tools.ModelNameContextKey, largeModel.CatwalkCfg.Name)
+			callContext = WithAPILogMetadata(callContext, APILogMetadata{
+				SessionID: call.SessionID,
+				RunID:     call.RunID,
+				Kind:      "agent_turn",
+			})
 			currentAssistant = &assistantMsg
 			return callContext, prepared, err
 		},
@@ -1296,6 +1306,12 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 
 	aiMsgs, _ := a.preparePrompt(msgs, largeModel.CatwalkCfg.SupportsImages)
 
+	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
+	ctx = WithAPILogMetadata(ctx, APILogMetadata{
+		SessionID: sessionID,
+		Kind:      "summarize_session",
+	})
+
 	genCtx, cancel := context.WithCancel(ctx)
 	a.activeRequests.Set(sessionID, cancel)
 	defer a.activeRequests.Del(sessionID)
@@ -1654,6 +1670,12 @@ func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, user
 			fantasy.WithUserAgent(userAgent),
 		)
 	}
+
+	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
+	ctx = WithAPILogMetadata(ctx, APILogMetadata{
+		SessionID: sessionID,
+		Kind:      "generate_title",
+	})
 
 	streamCall := fantasy.AgentStreamCall{
 		Prompt: fmt.Sprintf("Generate a concise title for the following content:\n\n%s\n <think>\n\n</think>", userPrompt),

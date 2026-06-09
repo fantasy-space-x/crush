@@ -752,6 +752,8 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 	if err != nil {
 		return Model{}, Model{}, err
 	}
+	largeModel = wrapLanguageModelWithAPILogging(largeModel, c.cfg.Config().Options.DataDirectory)
+	smallModel = wrapLanguageModelWithAPILogging(smallModel, c.cfg.Config().Options.DataDirectory)
 
 	return Model{
 			Model:      largeModel,
