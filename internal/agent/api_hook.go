@@ -233,6 +233,7 @@ func (m *apiHookModel) StreamObject(ctx context.Context, call fantasy.ObjectCall
 
 type apiHookRecord struct {
 	Timestamp  time.Time `json:"timestamp"`
+	Agent      string    `json:"agent"`
 	SessionID  string    `json:"session_id"`
 	RunID      string    `json:"run_id,omitempty"`
 	Kind       string    `json:"kind"`
@@ -250,6 +251,7 @@ type apiHookRecord struct {
 func newAPIHookRecord(metadata APILogMetadata, model fantasy.LanguageModel, start time.Time, stream bool, request any) apiHookRecord {
 	return apiHookRecord{
 		Timestamp:  start.UTC(),
+		Agent:      "crush",
 		SessionID:  metadata.SessionID,
 		RunID:      metadata.RunID,
 		Kind:       metadata.Kind,
@@ -261,7 +263,7 @@ func newAPIHookRecord(metadata APILogMetadata, model fantasy.LanguageModel, star
 	}
 }
 
-func sanitizeForJSON(v any) any {
+func sanitizeGenericForJSON(v any) any {
 	if v == nil {
 		return nil
 	}
@@ -282,15 +284,104 @@ func sanitizeForJSON(v any) any {
 	}
 }
 
+func sanitizeForJSON(v any) any {
+	switch call := v.(type) {
+	case fantasy.Call:
+		return sanitizeCall(call)
+	case *fantasy.Call:
+		if call == nil {
+			return nil
+		}
+		return sanitizeCall(*call)
+	case fantasy.ObjectCall:
+		return sanitizeObjectCall(call)
+	case *fantasy.ObjectCall:
+		if call == nil {
+			return nil
+		}
+		return sanitizeObjectCall(*call)
+	default:
+		return sanitizeGenericForJSON(v)
+	}
+}
+
+func sanitizeCall(call fantasy.Call) any {
+	return map[string]any{
+		"messages":          sanitizePrompt(call.Prompt),
+		"max_output_tokens": call.MaxOutputTokens,
+		"temperature":       call.Temperature,
+		"top_p":             call.TopP,
+		"top_k":             call.TopK,
+		"presence_penalty":  call.PresencePenalty,
+		"frequency_penalty": call.FrequencyPenalty,
+		"tools":             sanitizeGenericForJSON(call.Tools),
+		"tool_choice":       call.ToolChoice,
+		"provider_options":  sanitizeGenericForJSON(call.ProviderOptions),
+	}
+}
+
+func sanitizeObjectCall(call fantasy.ObjectCall) any {
+	return map[string]any{
+		"messages":           sanitizePrompt(call.Prompt),
+		"schema":             sanitizeGenericForJSON(call.Schema),
+		"schema_name":        call.SchemaName,
+		"schema_description": call.SchemaDescription,
+		"max_output_tokens":  call.MaxOutputTokens,
+		"temperature":        call.Temperature,
+		"top_p":              call.TopP,
+		"top_k":              call.TopK,
+		"presence_penalty":   call.PresencePenalty,
+		"frequency_penalty":  call.FrequencyPenalty,
+		"provider_options":   sanitizeGenericForJSON(call.ProviderOptions),
+	}
+}
+
+func sanitizePrompt(prompt fantasy.Prompt) []any {
+	messages := make([]any, 0, len(prompt))
+	for _, msg := range prompt {
+		entry := map[string]any{
+			"role":    msg.Role,
+			"content": sanitizeMessageParts(msg.Content),
+		}
+		if len(msg.ProviderOptions) > 0 {
+			entry["provider_options"] = sanitizeGenericForJSON(msg.ProviderOptions)
+		}
+		messages = append(messages, entry)
+	}
+	return messages
+}
+
+func sanitizeMessageParts(parts []fantasy.MessagePart) []any {
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		switch p := part.(type) {
+		case fantasy.TextPart:
+			out = append(out, map[string]any{
+				"type": "text",
+				"text": p.Text,
+			})
+		default:
+			out = append(out, sanitizeGenericForJSON(part))
+		}
+	}
+	return out
+}
+
 func sanitizeResponse(resp *fantasy.Response) any {
 	if resp == nil {
 		return nil
 	}
+	content := []any{}
+	if text := resp.Content.Text(); text != "" {
+		content = append(content, map[string]any{
+			"type": "text",
+			"text": text,
+		})
+	}
 	return map[string]any{
-		"text":              resp.Content.Text(),
+		"content":           content,
 		"reasoning_text":    resp.Content.ReasoningText(),
-		"content":           sanitizeForJSON(resp.Content),
-		"finish_reason":     resp.FinishReason,
+		"stop_reason":       resp.FinishReason,
 		"usage":             sanitizeForJSON(resp.Usage),
 		"warnings":          sanitizeForJSON(resp.Warnings),
 		"provider_metadata": sanitizeForJSON(resp.ProviderMetadata),
@@ -302,9 +393,10 @@ func sanitizeObjectResponse(resp *fantasy.ObjectResponse) any {
 		return nil
 	}
 	return map[string]any{
+		"content":           []any{map[string]any{"type": "text", "text": resp.RawText}},
 		"object":            sanitizeForJSON(resp.Object),
 		"raw_text":          resp.RawText,
-		"finish_reason":     resp.FinishReason,
+		"stop_reason":       resp.FinishReason,
 		"usage":             sanitizeForJSON(resp.Usage),
 		"warnings":          sanitizeForJSON(resp.Warnings),
 		"provider_metadata": sanitizeForJSON(resp.ProviderMetadata),
@@ -442,12 +534,15 @@ func (a *streamAccumulator) Response() any {
 		toolCalls = append(toolCalls, a.toolCalls[id])
 	}
 	return map[string]any{
-		"text":              joinBuilders(a.textOrder, a.textParts),
+		"content": []any{map[string]any{
+			"type": "text",
+			"text": joinBuilders(a.textOrder, a.textParts),
+		}},
 		"reasoning_text":    joinBuilders(a.reasoningOrder, a.reasoningParts),
 		"tool_calls":        toolCalls,
 		"tool_results":      a.toolResults,
 		"sources":           a.sources,
-		"finish_reason":     a.finishReason,
+		"stop_reason":       a.finishReason,
 		"usage":             sanitizeForJSON(a.usage),
 		"warnings":          a.warnings,
 		"provider_metadata": a.providerMeta,
@@ -514,9 +609,10 @@ func (a *objectStreamAccumulator) Complete() bool {
 
 func (a *objectStreamAccumulator) Response() any {
 	return map[string]any{
+		"content":           []any{map[string]any{"type": "text", "text": a.rawText.String()}},
 		"object":            a.object,
 		"raw_text":          a.rawText.String(),
-		"finish_reason":     a.finishReason,
+		"stop_reason":       a.finishReason,
 		"usage":             sanitizeForJSON(a.usage),
 		"warnings":          a.warnings,
 		"provider_metadata": a.providerMeta,

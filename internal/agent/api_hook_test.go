@@ -60,6 +60,7 @@ func TestAPIHookGenerateWritesJSONL(t *testing.T) {
 	require.NoError(t, err)
 
 	record := readSingleAPIHookRecord(t, filepath.Join(dataDir, "logs", "llm", "sess-generate.jsonl"))
+	require.Equal(t, "crush", record["agent"])
 	require.Equal(t, "sess-generate", record["session_id"])
 	require.Equal(t, "agent_turn", record["kind"])
 	require.Equal(t, "test-provider", record["provider"])
@@ -67,9 +68,19 @@ func TestAPIHookGenerateWritesJSONL(t *testing.T) {
 	require.Equal(t, false, record["stream"])
 	require.Equal(t, true, record["complete"])
 
+	request := record["request"].(map[string]any)
+	messages := request["messages"].([]any)
+	firstMessage := messages[0].(map[string]any)
+	require.Equal(t, string(fantasy.MessageRoleUser), firstMessage["role"])
+	firstContent := firstMessage["content"].([]any)[0].(map[string]any)
+	require.Equal(t, "text", firstContent["type"])
+	require.Equal(t, "hi", firstContent["text"])
+
 	response := record["response"].(map[string]any)
-	require.Equal(t, "hello world", response["text"])
-	require.Equal(t, string(fantasy.FinishReasonStop), response["finish_reason"])
+	content := response["content"].([]any)[0].(map[string]any)
+	require.Equal(t, "text", content["type"])
+	require.Equal(t, "hello world", content["text"])
+	require.Equal(t, string(fantasy.FinishReasonStop), response["stop_reason"])
 }
 
 func TestAPIHookStreamWritesIncompleteRecordWhenConsumerStopsEarly(t *testing.T) {
