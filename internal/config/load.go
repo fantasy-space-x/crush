@@ -32,9 +32,59 @@ import (
 
 const defaultCatwalkURL = "https://catwalk.charm.land"
 
+// RuntimeModelOverride describes model/provider settings injected by a
+// process startup flag. It is intentionally kept out of persisted config.
+type RuntimeModelOverride struct {
+	Provider string
+	Model    string
+	BaseURL  string
+	APIKey   string
+}
+
+func (o RuntimeModelOverride) IsZero() bool {
+	return o.Provider == "" && o.Model == "" && o.BaseURL == "" && o.APIKey == ""
+}
+
+// LoadOption customizes config loading without persisting changes.
+type LoadOption func(*RuntimeOverrides)
+
+// WithRuntimeOverrides applies non-persistent overrides during load.
+func WithRuntimeOverrides(overrides RuntimeOverrides) LoadOption {
+	return func(target *RuntimeOverrides) {
+		if overrides.SkipPermissionRequests {
+			target.SkipPermissionRequests = true
+		}
+		if overrides.DataDirectory != "" {
+			target.DataDirectory = overrides.DataDirectory
+		}
+		if !overrides.Model.IsZero() {
+			target.Model = overrides.Model
+		}
+	}
+}
+
+// WithRuntimeModelOverride applies a non-persistent model override.
+func WithRuntimeModelOverride(override RuntimeModelOverride) LoadOption {
+	return func(target *RuntimeOverrides) {
+		target.Model = override
+	}
+}
+
+// WithRuntimeDataDirectory applies a non-persistent data directory override.
+func WithRuntimeDataDirectory(dataDir string) LoadOption {
+	return func(target *RuntimeOverrides) {
+		target.DataDirectory = dataDir
+	}
+}
+
 // Load loads the configuration from the default paths and returns a
 // ConfigStore that owns both the pure-data Config and all runtime state.
-func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
+func Load(workingDir, dataDir string, debug bool, opts ...LoadOption) (*ConfigStore, error) {
+	var overrides RuntimeOverrides
+	for _, opt := range opts {
+		opt(&overrides)
+	}
+
 	// Migrate deprecated disable_notifications before loading config.
 	migrateDisableNotifications()
 
@@ -53,6 +103,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		globalDataPath: GlobalConfigData(),
 		workspacePath:  filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName)),
 		loadedPaths:    loadedPaths,
+		overrides:      overrides,
 	}
 
 	if debug {
@@ -73,6 +124,10 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 			store.config = cfg
 			store.loadedPaths = append(store.loadedPaths, store.workspacePath)
 		}
+	}
+
+	if err := cfg.applyRuntimeOverrides(overrides); err != nil {
+		return nil, err
 	}
 
 	// Validate hooks after all config merging is complete so workspace
@@ -131,6 +186,61 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	store.captureStalenessSnapshot(loadedPaths)
 
 	return store, nil
+}
+
+func (c *Config) applyRuntimeOverrides(overrides RuntimeOverrides) error {
+	if overrides.Model.IsZero() {
+		return nil
+	}
+	return c.applyRuntimeModelOverride(overrides.Model)
+}
+
+func (c *Config) applyRuntimeModelOverride(override RuntimeModelOverride) error {
+	if override.Model == "" {
+		return fmt.Errorf("runtime model override requires a model")
+	}
+
+	providerID := cmp.Or(override.Provider, "runtime")
+	providerConfig, _ := c.Providers.Get(providerID)
+	providerConfig.ID = providerID
+	providerConfig.Name = cmp.Or(providerConfig.Name, providerID)
+	if override.BaseURL != "" {
+		providerConfig.BaseURL = override.BaseURL
+	}
+	if override.APIKey != "" {
+		providerConfig.APIKey = override.APIKey
+		providerConfig.APIKeyTemplate = override.APIKey
+	}
+	if providerConfig.Type == "" && providerConfig.BaseURL != "" {
+		providerConfig.Type = catwalk.TypeOpenAICompat
+	}
+	if !slices.ContainsFunc(providerConfig.Models, func(model catwalk.Model) bool {
+		return model.ID == override.Model
+	}) {
+		providerConfig.Models = append([]catwalk.Model{runtimeModel(override.Model)}, providerConfig.Models...)
+	}
+	c.Providers.Set(providerID, providerConfig)
+
+	selected := SelectedModel{
+		Provider: providerID,
+		Model:    override.Model,
+	}
+	if model := c.GetModel(providerID, override.Model); model != nil {
+		selected.MaxTokens = model.DefaultMaxTokens
+		selected.ReasoningEffort = model.DefaultReasoningEffort
+	}
+	c.Models[SelectedModelTypeLarge] = selected
+	c.Models[SelectedModelTypeSmall] = selected
+	return nil
+}
+
+func runtimeModel(model string) catwalk.Model {
+	return catwalk.Model{
+		ID:               model,
+		Name:             model,
+		ContextWindow:    200000,
+		DefaultMaxTokens: 4096,
+	}
 }
 
 // mustMarshalConfig marshals the config to JSON bytes, returning empty JSON on

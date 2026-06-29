@@ -40,6 +40,8 @@ type fileSnapshot struct {
 // the lifetime of the process (or workspace).
 type RuntimeOverrides struct {
 	SkipPermissionRequests bool
+	DataDirectory          string
+	Model                  RuntimeModelOverride
 }
 
 // ConfigStore is the single entry point for all config access. It owns the
@@ -766,14 +768,17 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		}
 	}
 
+	// Preserve runtime overrides.
+	overrides := s.overrides
+	if err := cfg.applyRuntimeOverrides(overrides); err != nil {
+		return err
+	}
+
 	// Validate hooks after all config merging is complete so matcher
 	// regexes are recompiled on the reloaded config (mirrors Load).
 	if err := cfg.ValidateHooks(); err != nil {
 		return fmt.Errorf("invalid hook configuration on reload: %w", err)
 	}
-
-	// Preserve runtime overrides
-	overrides := s.overrides
 
 	// Reconfigure providers
 	env := env.New()

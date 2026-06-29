@@ -239,6 +239,14 @@ func (b *Backend) CreateWorkspace(args proto.Workspace) (*Workspace, proto.Works
 	if err != nil {
 		return nil, proto.Workspace{}, err
 	}
+	runtimeOverrides := config.RuntimeOverrides{}
+	if b.cfg != nil {
+		runtimeOverrides = *b.cfg.Overrides()
+	}
+	if args.DataDir == "" {
+		args.DataDir = runtimeOverrides.DataDirectory
+	}
+	runtimeOverrides.DataDirectory = args.DataDir
 
 	key, err := resolveWorkspaceKey(args.Path)
 	if err != nil {
@@ -266,7 +274,7 @@ func (b *Backend) CreateWorkspace(args proto.Workspace) (*Workspace, proto.Works
 	b.mu.Unlock()
 
 	id := uuid.New().String()
-	cfg, err := config.Init(args.Path, args.DataDir, args.Debug)
+	cfg, err := config.Init(args.Path, args.DataDir, args.Debug, config.WithRuntimeOverrides(runtimeOverrides))
 	if err != nil {
 		return nil, proto.Workspace{}, fmt.Errorf("failed to initialize config: %w", err)
 	}

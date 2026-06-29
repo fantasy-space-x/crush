@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
@@ -18,9 +21,21 @@ import (
 )
 
 var serverHost string
+var serverHostname string
+var serverPort int
+var serverBaseURL string
+var serverAPIKey string
+var serverModel string
+var serverHistoryDir string
 
 func init() {
 	serverCmd.Flags().StringVarP(&serverHost, "host", "H", server.DefaultHost(), "Server host (TCP or Unix socket)")
+	serverCmd.Flags().StringVar(&serverHostname, "hostname", "0.0.0.0", "TCP hostname to bind when --port is set")
+	serverCmd.Flags().IntVarP(&serverPort, "port", "p", 0, "TCP port to bind")
+	serverCmd.Flags().StringVar(&serverBaseURL, "base-url", "", "Runtime provider base URL")
+	serverCmd.Flags().StringVar(&serverAPIKey, "api-key", "", "Runtime provider API key")
+	serverCmd.Flags().StringVar(&serverModel, "model", "", "Runtime model, optionally in provider/model format")
+	serverCmd.Flags().StringVar(&serverHistoryDir, "history-dir", "", "Directory for server-created workspace history")
 	rootCmd.AddCommand(serverCmd)
 }
 
@@ -28,21 +43,29 @@ var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Start the Crush server",
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		dataDir, err := cmd.Flags().GetString("data-dir")
+		dataDir, err := serverDataDir(cmd)
 		if err != nil {
-			return fmt.Errorf("failed to get data directory: %v", err)
+			return err
 		}
 		debug, err := cmd.Flags().GetBool("debug")
 		if err != nil {
 			return fmt.Errorf("failed to get debug flag: %v", err)
 		}
+		overrides, err := serverRuntimeOverrides(dataDir)
+		if err != nil {
+			return err
+		}
 
-		cfg, err := config.Load(config.GlobalWorkspaceDir(), dataDir, debug)
+		cfg, err := config.Load(config.GlobalWorkspaceDir(), dataDir, debug, config.WithRuntimeOverrides(overrides))
 		if err != nil {
 			return fmt.Errorf("failed to load configuration: %v", err)
 		}
 
-		hostURL, err := server.ParseHostURL(serverHost)
+		listenHost, err := serverListenHost(cmd)
+		if err != nil {
+			return err
+		}
+		hostURL, err := server.ParseHostURL(listenHost)
 		if err != nil {
 			return fmt.Errorf("invalid server host: %v", err)
 		}
@@ -57,7 +80,7 @@ var serverCmd = &cobra.Command{
 
 		srv := server.NewServer(cfg, hostURL.Scheme, hostURL.Host)
 		srv.SetLogger(slog.Default())
-		slog.Info("Starting Crush server...", "addr", serverHost)
+		slog.Info("Starting Crush server...", "addr", listenHost)
 
 		errch := make(chan error, 1)
 		sigch := make(chan os.Signal, 1)
@@ -96,4 +119,86 @@ var serverCmd = &cobra.Command{
 
 		return nil
 	},
+}
+
+func serverDataDir(cmd *cobra.Command) (string, error) {
+	dataDir, err := cmd.Flags().GetString("data-dir")
+	if err != nil {
+		return "", fmt.Errorf("failed to get data directory: %v", err)
+	}
+	if serverHistoryDir == "" {
+		return absoluteFlagPath(dataDir)
+	}
+	if dataDir != "" {
+		return "", fmt.Errorf("--history-dir cannot be used with --data-dir")
+	}
+	return absoluteFlagPath(serverHistoryDir)
+}
+
+func absoluteFlagPath(path string) (string, error) {
+	if path == "" || filepath.IsAbs(path) {
+		return path, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve path %q: %v", path, err)
+	}
+	return abs, nil
+}
+
+func serverRuntimeOverrides(dataDir string) (config.RuntimeOverrides, error) {
+	model, err := serverRuntimeModel()
+	if err != nil {
+		return config.RuntimeOverrides{}, err
+	}
+	return config.RuntimeOverrides{
+		DataDirectory: dataDir,
+		Model:         model,
+	}, nil
+}
+
+func serverRuntimeModel() (config.RuntimeModelOverride, error) {
+	if serverModel == "" {
+		if serverBaseURL != "" || serverAPIKey != "" {
+			return config.RuntimeModelOverride{}, fmt.Errorf("--model is required when --base-url or --api-key is set")
+		}
+		return config.RuntimeModelOverride{}, nil
+	}
+	provider, model, err := parseRuntimeModel(serverModel)
+	if err != nil {
+		return config.RuntimeModelOverride{}, err
+	}
+	return config.RuntimeModelOverride{
+		Provider: provider,
+		Model:    model,
+		BaseURL:  serverBaseURL,
+		APIKey:   serverAPIKey,
+	}, nil
+}
+
+func parseRuntimeModel(model string) (string, string, error) {
+	provider, modelID, ok := strings.Cut(model, "/")
+	if !ok {
+		return "", model, nil
+	}
+	if provider == "" || modelID == "" {
+		return "", "", fmt.Errorf("invalid --model %q; use model or provider/model", model)
+	}
+	return provider, modelID, nil
+}
+
+func serverListenHost(cmd *cobra.Command) (string, error) {
+	if serverPort == 0 {
+		if cmd.Flags().Changed("hostname") {
+			return "", fmt.Errorf("--hostname requires --port")
+		}
+		return serverHost, nil
+	}
+	if serverPort < 0 || serverPort > 65535 {
+		return "", fmt.Errorf("invalid --port %d", serverPort)
+	}
+	if cmd.Flags().Changed("host") {
+		return "", fmt.Errorf("--host cannot be used with --port")
+	}
+	return "tcp://" + net.JoinHostPort(serverHostname, strconv.Itoa(serverPort)), nil
 }
