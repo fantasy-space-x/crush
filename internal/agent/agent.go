@@ -29,7 +29,7 @@ import (
 	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/bedrock"
 	"charm.land/fantasy/providers/google"
-	"charm.land/fantasy/providers/openai"
+	"charm.land/fantasy/providers/openai" 
 	"charm.land/fantasy/providers/openrouter"
 	"charm.land/fantasy/providers/vercel"
 	"charm.land/lipgloss/v2"

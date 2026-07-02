@@ -239,7 +239,7 @@ func runtimeModel(model string) catwalk.Model {
 		ID:               model,
 		Name:             model,
 		ContextWindow:    200000,
-		DefaultMaxTokens: 4096,
+		DefaultMaxTokens: 32768,
 	}
 }
 
