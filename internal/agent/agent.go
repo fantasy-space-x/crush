@@ -31,7 +31,7 @@ import (
 	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/bedrock"
 	"charm.land/fantasy/providers/google"
-	"charm.land/fantasy/providers/openai" 
+	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openrouter"
 	"charm.land/fantasy/providers/vercel"
 	"charm.land/lipgloss/v2"
@@ -159,6 +159,8 @@ type sessionAgent struct {
 	tools              *csync.Slice[fantasy.AgentTool]
 
 	isSubAgent           bool
+	agentName            string
+	workingDir           string
 	sessions             session.Service
 	messages             message.Service
 	disableAutoSummarize bool
@@ -213,6 +215,8 @@ type SessionAgentOptions struct {
 	SystemPromptPrefix   string
 	SystemPrompt         string
 	IsSubAgent           bool
+	AgentName            string
+	WorkingDir           string
 	DisableAutoSummarize bool
 	IsYolo               bool
 	Sessions             session.Service
@@ -231,6 +235,8 @@ func NewSessionAgent(
 		systemPromptPrefix:   csync.NewValue(opts.SystemPromptPrefix),
 		systemPrompt:         csync.NewValue(opts.SystemPrompt),
 		isSubAgent:           opts.IsSubAgent,
+		agentName:            opts.AgentName,
+		workingDir:           opts.WorkingDir,
 		sessions:             opts.Sessions,
 		messages:             opts.Messages,
 		disableAutoSummarize: opts.DisableAutoSummarize,
@@ -244,6 +250,16 @@ func NewSessionAgent(
 		acceptedRuns:         csync.NewMap[string, int](),
 		cancelMark:           csync.NewMap[string, uint64](),
 	}
+}
+
+func (a *sessionAgent) withAPILogMetadata(ctx context.Context, sessionID, runID, kind string) context.Context {
+	return WithAPILogMetadata(ctx, APILogMetadata{
+		SessionID:  sessionID,
+		RunID:      runID,
+		Kind:       kind,
+		AgentName:  a.agentName,
+		WorkingDir: a.workingDir,
+	})
 }
 
 // AcceptedRun owns exactly one accept reservation taken by
@@ -552,6 +568,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	if err := ValidateCall(call); err != nil {
 		return nil, err
 	}
+	ctx = context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
+	ctx = a.withAPILogMetadata(ctx, call.SessionID, call.RunID, "agent_turn")
 
 	// genCtx/cancel are the run context and its cancel func. For the
 	// accepted (fire-and-forget) dispatch path they are created under
@@ -619,8 +637,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		// Idle: become the active run. Register the cancel func before
 		// dropping the lock so a Cancel that arrives between here and
 		// assistant creation is not lost.
-		runCtx := context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
-		genCtx, cancel = context.WithCancel(runCtx)
+		genCtx, cancel = context.WithCancel(ctx)
 		a.activeRequests.Set(call.SessionID, cancel)
 		activeRegistered = true
 		call.Accepted.Close()
@@ -700,14 +717,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		return nil, err
 	}
 	userMsgCreated = true
-
-	// Add the session to the context.
-	ctx = context.WithValue(ctx, tools.SessionIDContextKey, call.SessionID)
-	ctx = WithAPILogMetadata(ctx, APILogMetadata{
-		SessionID: call.SessionID,
-		RunID:     call.RunID,
-		Kind:      "agent_turn",
-	})
 
 	// For the accepted dispatch path the run context and cancel func
 	// were already created and registered under dispatchMu above; reuse
@@ -873,11 +882,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			callContext = context.WithValue(callContext, tools.MessageIDContextKey, assistantMsg.ID)
 			callContext = context.WithValue(callContext, tools.SupportsImagesContextKey, largeModel.CatwalkCfg.SupportsImages)
 			callContext = context.WithValue(callContext, tools.ModelNameContextKey, largeModel.CatwalkCfg.Name)
-			callContext = WithAPILogMetadata(callContext, APILogMetadata{
-				SessionID: call.SessionID,
-				RunID:     call.RunID,
-				Kind:      "agent_turn",
-			})
+			callContext = a.withAPILogMetadata(callContext, call.SessionID, call.RunID, "agent_turn")
 			currentAssistant = &assistantMsg
 			return callContext, prepared, err
 		},
@@ -1324,10 +1329,7 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	aiMsgs, _ := a.preparePrompt(msgs, largeModel.CatwalkCfg.SupportsImages)
 
 	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
-	ctx = WithAPILogMetadata(ctx, APILogMetadata{
-		SessionID: sessionID,
-		Kind:      "summarize_session",
-	})
+	ctx = a.withAPILogMetadata(ctx, sessionID, "", "summarize_session")
 
 	genCtx, cancel := context.WithCancel(ctx)
 	a.activeRequests.Set(sessionID, cancel)
@@ -1353,6 +1355,7 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	if err != nil {
 		return err
 	}
+	genCtx = context.WithValue(genCtx, tools.MessageIDContextKey, summaryMessage.ID)
 
 	summaryPromptText := buildSummaryPrompt(currentSession.Todos)
 
@@ -1714,10 +1717,7 @@ func (a *sessionAgent) GenerateTitle(ctx context.Context, sessionID string, user
 	}
 
 	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
-	ctx = WithAPILogMetadata(ctx, APILogMetadata{
-		SessionID: sessionID,
-		Kind:      "generate_title",
-	})
+	ctx = a.withAPILogMetadata(ctx, sessionID, "", "generate_title")
 
 	streamCall := fantasy.AgentStreamCall{
 		Prompt: fmt.Sprintf("Generate a concise title for the following content:\n\n%s\n <think>\n\n</think>", userPrompt),

@@ -590,6 +590,8 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		SystemPromptPrefix:   largeProviderCfg.SystemPromptPrefix,
 		SystemPrompt:         "",
 		IsSubAgent:           isSubAgent,
+		AgentName:            agent.Name,
+		WorkingDir:           c.cfg.WorkingDir(),
 		DisableAutoSummarize: c.cfg.Config().Options.DisableAutoSummarize,
 		IsYolo:               c.permissions.SkipRequests(),
 		Sessions:             c.sessions,
@@ -803,8 +805,8 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 	if err != nil {
 		return Model{}, Model{}, err
 	}
-	largeModel = wrapLanguageModelWithAPILogging(largeModel, c.cfg.Config().Options.DataDirectory)
-	smallModel = wrapLanguageModelWithAPILogging(smallModel, c.cfg.Config().Options.DataDirectory)
+	largeModel = wrapLanguageModelWithAPILogging(largeModel)
+	smallModel = wrapLanguageModelWithAPILogging(smallModel)
 
 	return Model{
 			Model:      largeModel,
