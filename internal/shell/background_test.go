@@ -304,6 +304,37 @@ func TestBackgroundShellManager_KillAll_Timeout(t *testing.T) {
 	require.Less(t, elapsed, 2*time.Second)
 }
 
+func TestBackgroundShellManager_KillSession(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	manager := newBackgroundShellManager()
+
+	shell1, err := manager.StartForSession(t.Context(), "session-a", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+	shell2, err := manager.StartForSession(t.Context(), "session-a", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+	other, err := manager.StartForSession(t.Context(), "session-b", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = manager.Kill(other.ID)
+	})
+
+	killed := manager.KillSession(t.Context(), "session-a")
+	require.Equal(t, 2, killed)
+
+	require.True(t, shell1.IsDone())
+	require.True(t, shell2.IsDone())
+	require.False(t, other.IsDone())
+
+	_, ok := manager.Get(shell1.ID)
+	require.False(t, ok)
+	_, ok = manager.Get(shell2.ID)
+	require.False(t, ok)
+	_, ok = manager.Get(other.ID)
+	require.True(t, ok)
+}
+
 func TestBackgroundShell_WaitContext_Completed(t *testing.T) {
 	t.Parallel()
 

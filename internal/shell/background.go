@@ -46,6 +46,7 @@ func (sb *syncBuffer) String() string {
 // BackgroundShell represents a shell running in the background.
 type BackgroundShell struct {
 	ID          string
+	SessionID   string
 	Command     string
 	Description string
 	Shell       *Shell
@@ -87,6 +88,11 @@ func GetBackgroundShellManager() *BackgroundShellManager {
 
 // Start creates and starts a new background shell with the given command.
 func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
+	return m.StartForSession(ctx, "", workingDir, blockFuncs, command, description)
+}
+
+// StartForSession creates and starts a new background shell for sessionID.
+func (m *BackgroundShellManager) StartForSession(ctx context.Context, sessionID string, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
 	// Check job limit
 	if m.shells.Len() >= MaxBackgroundJobs {
 		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
@@ -103,6 +109,7 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 
 	bgShell := &BackgroundShell{
 		ID:          id,
+		SessionID:   sessionID,
 		Command:     command,
 		Description: description,
 		WorkingDir:  workingDir,
@@ -141,6 +148,38 @@ func (m *BackgroundShellManager) Remove(id string) error {
 		return fmt.Errorf("background shell not found: %s", id)
 	}
 	return nil
+}
+
+// KillSession terminates all background shells associated with sessionID.
+func (m *BackgroundShellManager) KillSession(ctx context.Context, sessionID string) int {
+	if sessionID == "" {
+		return 0
+	}
+
+	var shells []*BackgroundShell
+	for id, shell := range m.shells.Seq2() {
+		if shell.SessionID != sessionID {
+			continue
+		}
+		taken, ok := m.shells.Take(id)
+		if ok {
+			shells = append(shells, taken)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for _, shell := range shells {
+		wg.Go(func() {
+			shell.cancel()
+			select {
+			case <-shell.done:
+			case <-ctx.Done():
+			}
+		})
+	}
+	wg.Wait()
+
+	return len(shells)
 }
 
 // Kill terminates a background shell by ID.

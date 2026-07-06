@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/notify"
@@ -172,6 +173,9 @@ func (b *Backend) CancelSession(workspaceID, sessionID string) error {
 	if ws.AgentCoordinator != nil {
 		ws.AgentCoordinator.Cancel(sessionID)
 	}
+	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+	shell.GetBackgroundShellManager().KillSession(ctx, sessionID)
+	cancel()
 	return nil
 }
 

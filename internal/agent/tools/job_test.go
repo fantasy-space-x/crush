@@ -96,6 +96,26 @@ func TestBackgroundShell_MultipleOutputCalls(t *testing.T) {
 	require.Equal(t, stdout1, stdout2, "Multiple GetOutput calls should return same result")
 }
 
+func TestJobOutputWaitTimeoutLeavesJobRunning(t *testing.T) {
+	t.Parallel()
+
+	waiting := make(chan struct{})
+	waitContext := func(ctx context.Context) bool {
+		close(waiting)
+		<-ctx.Done()
+		return false
+	}
+
+	completed := waitForJobOutput(t.Context(), waitContext, 50*time.Millisecond)
+	require.False(t, completed)
+
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("wait function was not called")
+	}
+}
+
 func TestBackgroundShell_EmptyOutput(t *testing.T) {
 	t.Parallel()
 

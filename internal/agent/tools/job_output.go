@@ -5,13 +5,15 @@ import (
 	_ "embed"
 	"fmt"
 	"strings"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/shell"
 )
 
 const (
-	JobOutputToolName = "job_output"
+	JobOutputToolName           = "job_output"
+	DefaultJobOutputWaitTimeout = 3 * time.Minute
 )
 
 //go:embed job_output.md
@@ -46,7 +48,7 @@ func NewJobOutputTool() fantasy.AgentTool {
 			}
 
 			if params.Wait {
-				bgShell.WaitContext(ctx)
+				waitForJobOutput(ctx, bgShell.WaitContext, DefaultJobOutputWaitTimeout)
 			}
 
 			stdout, stderr, done, err := bgShell.GetOutput()
@@ -89,4 +91,13 @@ func NewJobOutputTool() fantasy.AgentTool {
 			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(result), metadata), nil
 		},
 	)
+}
+
+func waitForJobOutput(ctx context.Context, waitContext func(context.Context) bool, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return waitContext(ctx)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return waitContext(waitCtx)
 }

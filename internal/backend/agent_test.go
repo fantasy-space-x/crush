@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -23,6 +24,7 @@ type blockingCoordinator struct {
 	entered  chan struct{}
 	release  chan struct{}
 	runCount atomic.Int32
+	cancelID atomic.Value
 }
 
 func newBlockingCoordinator() *blockingCoordinator {
@@ -47,7 +49,7 @@ func (c *blockingCoordinator) RunAccepted(ctx context.Context, accept *agent.Acc
 }
 
 func (c *blockingCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun { return nil }
-func (c *blockingCoordinator) Cancel(string)                                     {}
+func (c *blockingCoordinator) Cancel(sessionID string)                           { c.cancelID.Store(sessionID) }
 func (c *blockingCoordinator) CancelAll()                                        {}
 func (c *blockingCoordinator) IsBusy() bool                                      { return false }
 func (c *blockingCoordinator) IsSessionBusy(string) bool                         { return false }
@@ -161,4 +163,63 @@ func TestSendMessage_SuccessIncrementsRunWG(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("runWG.Wait did not complete after the run returned")
 	}
+}
+
+func TestCancelSession_KillsBackgroundShells(t *testing.T) {
+	manager := shell.GetBackgroundShellManager()
+	manager.KillAll(t.Context())
+	t.Cleanup(func() {
+		manager.KillAll(t.Context())
+	})
+
+	b, _ := newTestBackend(t)
+	coord := newBlockingCoordinator()
+	ws := insertAgentWorkspace(t, b, coord)
+
+	workingDir := t.TempDir()
+	shellA, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+	shellB, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+	other, err := manager.StartForSession(t.Context(), "S3", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+
+	require.NoError(t, b.CancelSession(ws.ID, "S2"))
+
+	require.Equal(t, "S2", coord.cancelID.Load())
+	require.True(t, shellA.IsDone())
+	require.True(t, shellB.IsDone())
+	require.False(t, other.IsDone())
+
+	_, ok := manager.Get(shellA.ID)
+	require.False(t, ok)
+	_, ok = manager.Get(shellB.ID)
+	require.False(t, ok)
+	_, ok = manager.Get(other.ID)
+	require.True(t, ok)
+}
+
+func TestDetachClient_DoesNotKillBackgroundShells(t *testing.T) {
+	manager := shell.GetBackgroundShellManager()
+	manager.KillAll(t.Context())
+	t.Cleanup(func() {
+		manager.KillAll(t.Context())
+	})
+
+	b, _ := newTestBackend(t)
+	ws, _ := insertTestWorkspace(t, b, "/tmp/current-session-detach-keeps-background")
+
+	cid := newClientID(t)
+	require.NoError(t, b.AttachClient(ws.ID, cid))
+	require.NoError(t, b.SetCurrentSession(ws.ID, cid, "S2"))
+
+	workingDir := t.TempDir()
+	bgShell, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+
+	b.DetachClient(ws.ID, cid)
+
+	require.False(t, bgShell.IsDone())
+	_, ok := manager.Get(bgShell.ID)
+	require.True(t, ok)
 }
