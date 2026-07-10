@@ -3,14 +3,17 @@ package tools
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/shell"
 )
 
 const (
-	JobKillToolName = "job_kill"
+	JobKillToolName       = "job_kill"
+	DefaultJobKillTimeout = 5 * time.Second
 )
 
 //go:embed job_kill.md
@@ -24,6 +27,7 @@ type JobKillResponseMetadata struct {
 	ShellID     string `json:"shell_id"`
 	Command     string `json:"command"`
 	Description string `json:"description"`
+	TimedOut    bool   `json:"timed_out,omitempty"`
 }
 
 func NewJobKillTool() fantasy.AgentTool {
@@ -48,8 +52,16 @@ func NewJobKillTool() fantasy.AgentTool {
 				Description: bgShell.Description,
 			}
 
-			err := bgManager.Kill(params.ShellID)
+			killCtx, cancel := context.WithTimeout(ctx, DefaultJobKillTimeout)
+			defer cancel()
+
+			err := bgManager.KillContext(killCtx, params.ShellID)
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					metadata.TimedOut = true
+					result := fmt.Sprintf("Terminate request sent to background shell %s, but it did not finish within %s. Ignoring the remaining kill result.", params.ShellID, DefaultJobKillTimeout)
+					return fantasy.WithResponseMetadata(fantasy.NewTextResponse(result), metadata), nil
+				}
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 

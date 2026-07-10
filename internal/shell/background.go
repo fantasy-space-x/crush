@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,7 @@ type BackgroundShell struct {
 	Description string
 	Shell       *Shell
 	WorkingDir  string
+	startedAt   time.Time
 	ctx         context.Context
 	cancel      context.CancelFunc
 	stdout      *syncBuffer
@@ -93,12 +95,14 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 
 // StartForSession creates and starts a new background shell for sessionID.
 func (m *BackgroundShellManager) StartForSession(ctx context.Context, sessionID string, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
-	// Check job limit
-	if m.shells.Len() >= MaxBackgroundJobs {
-		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
+	for m.shells.Len() >= MaxBackgroundJobs {
+		if !m.evictOldestBackgroundShell() {
+			return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
+		}
 	}
 
 	id := fmt.Sprintf("%03X", idCounter.Add(1))
+	startedAt := time.Now()
 
 	shell := NewShell(&Options{
 		WorkingDir: workingDir,
@@ -114,6 +118,7 @@ func (m *BackgroundShellManager) StartForSession(ctx context.Context, sessionID 
 		Description: description,
 		WorkingDir:  workingDir,
 		Shell:       shell,
+		startedAt:   startedAt,
 		ctx:         shellCtx,
 		cancel:      cancel,
 		stdout:      &syncBuffer{},
@@ -133,6 +138,46 @@ func (m *BackgroundShellManager) StartForSession(ctx context.Context, sessionID 
 	}()
 
 	return bgShell, nil
+}
+
+func (m *BackgroundShellManager) evictOldestBackgroundShell() bool {
+	var oldestID string
+	var oldest *BackgroundShell
+	for id, shell := range m.shells.Seq2() {
+		if oldest == nil || backgroundShellStartedBefore(shell, oldest) {
+			oldestID = id
+			oldest = shell
+		}
+	}
+	if oldest == nil {
+		return false
+	}
+
+	evicted, ok := m.shells.Take(oldestID)
+	if !ok {
+		return false
+	}
+	if evicted.cancel != nil {
+		evicted.cancel()
+	}
+	slog.Warn("Cleared oldest background shell after reaching maximum job limit",
+		"max_background_jobs", MaxBackgroundJobs,
+		"shell_id", evicted.ID,
+		"session_id", evicted.SessionID,
+		"command", evicted.Command,
+		"started_at", evicted.startedAt,
+	)
+	return true
+}
+
+func backgroundShellStartedBefore(a, b *BackgroundShell) bool {
+	if b.startedAt.IsZero() {
+		return false
+	}
+	if a.startedAt.IsZero() {
+		return true
+	}
+	return a.startedAt.Before(b.startedAt)
 }
 
 // Get retrieves a background shell by ID.
@@ -184,14 +229,24 @@ func (m *BackgroundShellManager) KillSession(ctx context.Context, sessionID stri
 
 // Kill terminates a background shell by ID.
 func (m *BackgroundShellManager) Kill(id string) error {
+	return m.KillContext(context.Background(), id)
+}
+
+// KillContext terminates a background shell by ID and waits until either the
+// shell exits or ctx is canceled.
+func (m *BackgroundShellManager) KillContext(ctx context.Context, id string) error {
 	shell, ok := m.shells.Take(id)
 	if !ok {
 		return fmt.Errorf("background shell not found: %s", id)
 	}
 
 	shell.cancel()
-	<-shell.done
-	return nil
+	select {
+	case <-shell.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // BackgroundShellInfo contains information about a background shell.

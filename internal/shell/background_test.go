@@ -2,6 +2,7 @@ package shell
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"strings"
 	"testing"
@@ -113,6 +114,125 @@ func TestBackgroundShellManager_KillNonExistent(t *testing.T) {
 	err := manager.Kill("non-existent-id")
 	if err == nil {
 		t.Error("expected error when killing non-existent shell")
+	}
+}
+
+func TestBackgroundShellManager_KillContextTimeout(t *testing.T) {
+	t.Parallel()
+
+	manager := newBackgroundShellManager()
+	canceled := make(chan struct{})
+	bgShell := &BackgroundShell{
+		ID:     "timeout-test",
+		cancel: func() { close(canceled) },
+		done:   make(chan struct{}),
+	}
+	manager.shells.Set(bgShell.ID, bgShell)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := manager.KillContext(ctx, bgShell.ID)
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, elapsed, time.Second)
+
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("shell was not canceled")
+	}
+
+	_, ok := manager.Get(bgShell.ID)
+	require.False(t, ok)
+}
+
+func TestBackgroundShellManager_EvictOldestBackgroundShell(t *testing.T) {
+	t.Parallel()
+
+	manager := newBackgroundShellManager()
+	now := time.Now()
+	oldCanceled := make(chan struct{})
+	newCanceled := make(chan struct{})
+
+	oldShell := &BackgroundShell{
+		ID:        "old",
+		SessionID: "session-old",
+		Command:   "old command",
+		startedAt: now.Add(-time.Minute),
+		cancel:    func() { close(oldCanceled) },
+		done:      make(chan struct{}),
+	}
+	newShell := &BackgroundShell{
+		ID:        "new",
+		SessionID: "session-new",
+		Command:   "new command",
+		startedAt: now,
+		cancel:    func() { close(newCanceled) },
+		done:      make(chan struct{}),
+	}
+	manager.shells.Set(oldShell.ID, oldShell)
+	manager.shells.Set(newShell.ID, newShell)
+
+	require.True(t, manager.evictOldestBackgroundShell())
+
+	_, ok := manager.Get(oldShell.ID)
+	require.False(t, ok)
+	_, ok = manager.Get(newShell.ID)
+	require.True(t, ok)
+
+	select {
+	case <-oldCanceled:
+	default:
+		t.Fatal("oldest shell was not canceled")
+	}
+	select {
+	case <-newCanceled:
+		t.Fatal("newer shell was canceled")
+	default:
+	}
+}
+
+func TestBackgroundShellManager_StartForSessionEvictsOldestAtLimit(t *testing.T) {
+	t.Parallel()
+
+	manager := newBackgroundShellManager()
+	now := time.Now()
+	oldCanceled := make(chan struct{})
+	for i := range MaxBackgroundJobs {
+		id := fmt.Sprintf("fake-%02d", i)
+		cancel := func() {}
+		if i == 0 {
+			cancel = func() { close(oldCanceled) }
+		}
+		manager.shells.Set(id, &BackgroundShell{
+			ID:        id,
+			startedAt: now.Add(time.Duration(i) * time.Second),
+			cancel:    cancel,
+			done:      make(chan struct{}),
+		})
+	}
+
+	bgShell, err := manager.StartForSession(t.Context(), "new-session", t.TempDir(), nil, "echo 'new shell'", "")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = manager.KillContext(ctx, bgShell.ID)
+	})
+
+	_, ok := manager.Get("fake-00")
+	require.False(t, ok)
+	_, ok = manager.Get(bgShell.ID)
+	require.True(t, ok)
+	require.Len(t, manager.List(), MaxBackgroundJobs)
+
+	select {
+	case <-oldCanceled:
+	default:
+		t.Fatal("oldest shell was not canceled")
 	}
 }
 

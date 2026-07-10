@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/crush/internal/event"
-	"github.com/charmbracelet/x/term"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -36,8 +35,7 @@ func Setup(logFile string, debug bool, ws ...io.Writer) {
 		}
 
 		opts := &slog.HandlerOptions{
-			Level:     level,
-			AddSource: true,
+			Level: level,
 		}
 
 		var handlers []slog.Handler
@@ -47,16 +45,26 @@ func Setup(logFile string, debug bool, ws ...io.Writer) {
 			if w == nil {
 				continue
 			}
-			if f, ok := w.(term.File); ok && term.IsTerminal(f.Fd()) {
-				handlers = append(handlers, slog.NewTextHandler(w, opts))
-			} else {
-				handlers = append(handlers, slog.NewJSONHandler(w, opts))
-			}
+			handlers = append(handlers, newConsoleHandler(w, level))
 		}
 
 		slog.SetDefault(slog.New(slog.NewMultiHandler(handlers...)))
 		initialized.Store(true)
 	})
+}
+
+func newConsoleHandler(w io.Writer, level slog.Leveler) slog.Handler {
+	return slog.NewTextHandler(w, &slog.HandlerOptions{
+		Level:       level,
+		ReplaceAttr: compactConsoleAttr,
+	})
+}
+
+func compactConsoleAttr(_ []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey {
+		a.Value = slog.StringValue(a.Value.Time().Format("15:04:05"))
+	}
+	return a
 }
 
 func Initialized() bool {

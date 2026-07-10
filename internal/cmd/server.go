@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +29,7 @@ var serverBaseURL string
 var serverAPIKey string
 var serverModel string
 var serverHistoryDir string
+var serverLogOutput string
 
 func init() {
 	serverCmd.Flags().StringVarP(&serverHost, "host", "H", server.DefaultHost(), "Server host (TCP or Unix socket)")
@@ -36,6 +39,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverAPIKey, "api-key", "", "Runtime provider API key")
 	serverCmd.Flags().StringVar(&serverModel, "model", "", "Runtime model, optionally in provider/model format")
 	serverCmd.Flags().StringVar(&serverHistoryDir, "history-dir", "", "Directory for server-created workspace history")
+	serverCmd.Flags().StringVar(&serverLogOutput, "log-output", "auto", "Mirror server logs to auto, file, stderr, or stdout")
 	rootCmd.AddCommand(serverCmd)
 }
 
@@ -72,15 +76,15 @@ var serverCmd = &cobra.Command{
 
 		logFile := filepath.Join(config.GlobalCacheDir(), "server-"+safeHostName(hostURL), "crush.log")
 
-		if term.IsTerminal(os.Stderr.Fd()) {
-			crushlog.Setup(logFile, debug, os.Stderr)
-		} else {
-			crushlog.Setup(logFile, debug)
+		logWriters, err := serverLogWriters(serverLogOutput)
+		if err != nil {
+			return err
 		}
+		crushlog.Setup(logFile, debug, logWriters...)
 
 		srv := server.NewServer(cfg, hostURL.Scheme, hostURL.Host)
 		srv.SetLogger(slog.Default())
-		slog.Info("Starting Crush server...", "addr", listenHost)
+		slog.Info("Starting Crush server", serverStartupAttrs(cfg, listenHost, logFile, debug, overrides)...)
 
 		errch := make(chan error, 1)
 		sigch := make(chan os.Signal, 1)
@@ -119,6 +123,76 @@ var serverCmd = &cobra.Command{
 
 		return nil
 	},
+}
+
+func serverStartupAttrs(
+	store *config.ConfigStore,
+	listenHost, logFile string,
+	debug bool,
+	overrides config.RuntimeOverrides,
+) []any {
+	cfg := store.Config()
+	return []any{
+		"host", listenHost,
+		"data_dir", cfg.Options.DataDirectory,
+		"log_file", logFile,
+		"log_output", serverLogOutput,
+		"debug", debug,
+		"runtime_model", runtimeModelLabel(overrides.Model),
+		"runtime_base_url", baseURLLabel(overrides.Model.BaseURL),
+		"runtime_api_key", setStatus(overrides.Model.APIKey),
+	}
+}
+
+func serverLogWriters(output string) ([]io.Writer, error) {
+	switch output {
+	case "auto":
+		if term.IsTerminal(os.Stderr.Fd()) {
+			return []io.Writer{os.Stderr}, nil
+		}
+		return nil, nil
+	case "file":
+		return nil, nil
+	case "stderr":
+		return []io.Writer{os.Stderr}, nil
+	case "stdout":
+		return []io.Writer{os.Stdout}, nil
+	default:
+		return nil, fmt.Errorf("invalid --log-output %q; use auto, file, stderr, or stdout", output)
+	}
+}
+
+func runtimeModelLabel(model config.RuntimeModelOverride) string {
+	if model.Model == "" {
+		return "none"
+	}
+	if model.Provider == "" {
+		return model.Model
+	}
+	return model.Provider + "/" + model.Model
+}
+
+func baseURLLabel(value string) string {
+	if value == "" {
+		return "none"
+	}
+	return sanitizeBaseURL(value)
+}
+
+func sanitizeBaseURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.User == nil {
+		return value
+	}
+	parsed.User = url.User("redacted")
+	return parsed.String()
+}
+
+func setStatus(value string) string {
+	if value == "" {
+		return "unset"
+	}
+	return "set"
 }
 
 func serverDataDir(cmd *cobra.Command) (string, error) {
