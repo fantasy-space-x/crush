@@ -528,14 +528,30 @@ func (b *Backend) releaseHoldLocked(ws *Workspace, clientID string) {
 }
 
 func (b *Backend) detachStream(ws *Workspace, clientID string) {
+	var sessionID string
+	var currentSessionID string
+	var streamsBefore int
+	var streamsAfter int
+
 	ws.clientsMu.Lock()
 	cs, ok := ws.clients[clientID]
 	if !ok {
 		ws.clientsMu.Unlock()
+		slog.Info("Detaching client stream",
+			"workspace_id", ws.ID,
+			"client_id", clientID,
+			"client_found", false,
+		)
 		return
 	}
+	currentSessionID = cs.currentSessionID
+	streamsBefore = cs.streams
 	if cs.streams > 0 {
 		cs.streams--
+	}
+	streamsAfter = cs.streams
+	if cs.streams == 0 && cs.currentSessionID != "" && !hasAttachedClientForSession(ws.clients, cs.currentSessionID) {
+		sessionID = cs.currentSessionID
 	}
 	teardown := false
 	if cs.streams == 0 && cs.holdTimer == nil {
@@ -543,9 +559,29 @@ func (b *Backend) detachStream(ws *Workspace, clientID string) {
 		teardown = len(ws.clients) == 0
 	}
 	ws.clientsMu.Unlock()
+	slog.Info("Detaching client stream",
+		"workspace_id", ws.ID,
+		"client_id", clientID,
+		"session_id", currentSessionID,
+		"streams_before", streamsBefore,
+		"streams_after", streamsAfter,
+		"will_cancel_session", sessionID != "",
+	)
+	if sessionID != "" {
+		b.cancelWorkspaceSession(ws, sessionID)
+	}
 	if teardown {
 		b.teardown(ws)
 	}
+}
+
+func hasAttachedClientForSession(clients map[string]*clientState, sessionID string) bool {
+	for _, cs := range clients {
+		if cs.streams > 0 && cs.currentSessionID == sessionID {
+			return true
+		}
+	}
+	return false
 }
 
 // teardown removes the workspace from the index, shuts down its

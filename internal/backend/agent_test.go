@@ -199,7 +199,7 @@ func TestCancelSession_KillsBackgroundShells(t *testing.T) {
 	require.True(t, ok)
 }
 
-func TestDetachClient_DoesNotKillBackgroundShells(t *testing.T) {
+func TestDetachClient_KillsCurrentSessionBackgroundShells(t *testing.T) {
 	manager := shell.GetBackgroundShellManager()
 	manager.KillAll(t.Context())
 	t.Cleanup(func() {
@@ -207,19 +207,65 @@ func TestDetachClient_DoesNotKillBackgroundShells(t *testing.T) {
 	})
 
 	b, _ := newTestBackend(t)
-	ws, _ := insertTestWorkspace(t, b, "/tmp/current-session-detach-keeps-background")
+	coord := newBlockingCoordinator()
+	ws := insertAgentWorkspace(t, b, coord)
 
 	cid := newClientID(t)
 	require.NoError(t, b.AttachClient(ws.ID, cid))
 	require.NoError(t, b.SetCurrentSession(ws.ID, cid, "S2"))
 
 	workingDir := t.TempDir()
-	bgShell, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	shellA, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+	other, err := manager.StartForSession(t.Context(), "S3", workingDir, nil, "while true; do :; done", "")
 	require.NoError(t, err)
 
 	b.DetachClient(ws.ID, cid)
 
+	require.Equal(t, "S2", coord.cancelID.Load())
+	require.True(t, shellA.IsDone())
+	require.False(t, other.IsDone())
+
+	_, ok := manager.Get(shellA.ID)
+	require.False(t, ok)
+	_, ok = manager.Get(other.ID)
+	require.True(t, ok)
+}
+
+func TestDetachClient_KeepsCurrentSessionWhenAnotherClientIsAttached(t *testing.T) {
+	manager := shell.GetBackgroundShellManager()
+	manager.KillAll(t.Context())
+	t.Cleanup(func() {
+		manager.KillAll(t.Context())
+	})
+
+	b, _ := newTestBackend(t)
+	coord := newBlockingCoordinator()
+	ws := insertAgentWorkspace(t, b, coord)
+
+	cidA := newClientID(t)
+	require.NoError(t, b.AttachClient(ws.ID, cidA))
+	require.NoError(t, b.SetCurrentSession(ws.ID, cidA, "S2"))
+
+	cidB := newClientID(t)
+	require.NoError(t, b.AttachClient(ws.ID, cidB))
+	require.NoError(t, b.SetCurrentSession(ws.ID, cidB, "S2"))
+
+	workingDir := t.TempDir()
+	bgShell, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	require.NoError(t, err)
+
+	b.DetachClient(ws.ID, cidA)
+
+	require.Nil(t, coord.cancelID.Load())
 	require.False(t, bgShell.IsDone())
 	_, ok := manager.Get(bgShell.ID)
 	require.True(t, ok)
+
+	b.DetachClient(ws.ID, cidB)
+
+	require.Equal(t, "S2", coord.cancelID.Load())
+	require.True(t, bgShell.IsDone())
+	_, ok = manager.Get(bgShell.ID)
+	require.False(t, ok)
 }

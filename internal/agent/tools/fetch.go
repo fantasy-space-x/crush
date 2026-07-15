@@ -74,7 +74,7 @@ func NewFetchTool(permissions permission.Service, workingDir string, client *htt
 
 			sessionID := GetSessionFromContext(ctx)
 			if sessionID == "" {
-				return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for creating a new file")
+				return fantasy.NewTextErrorResponse("Session ID is required for fetching URLs"), nil
 			}
 
 			p, err := permissions.Request(
@@ -90,7 +90,7 @@ func NewFetchTool(permissions permission.Service, workingDir string, client *htt
 				},
 			)
 			if err != nil {
-				return fantasy.ToolResponse{}, err
+				return fantasy.NewTextErrorResponse("Failed to request permission: " + err.Error()), nil
 			}
 			if !p {
 				return NewPermissionDeniedResponse(), nil
@@ -112,14 +112,14 @@ func NewFetchTool(permissions permission.Service, workingDir string, client *htt
 
 			req, err := http.NewRequestWithContext(requestCtx, "GET", params.URL, nil)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to create request: %w", err)
+				return fantasy.NewTextErrorResponse("Failed to create request: " + err.Error()), nil
 			}
 
 			req.Header.Set("User-Agent", "crush/1.0")
 
 			resp, err := client.Do(req)
 			if err != nil {
-				return fantasy.ToolResponse{}, fmt.Errorf("failed to fetch URL: %w", err)
+				return fantasy.NewTextErrorResponse("Failed to fetch URL: " + err.Error()), nil
 			}
 			defer resp.Body.Close()
 

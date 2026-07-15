@@ -170,13 +170,20 @@ func (b *Backend) CancelSession(workspaceID, sessionID string) error {
 		return err
 	}
 
-	if ws.AgentCoordinator != nil {
+	b.cancelWorkspaceSession(ws, sessionID)
+	return nil
+}
+
+func (b *Backend) cancelWorkspaceSession(ws *Workspace, sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	if ws != nil && ws.App != nil && ws.AgentCoordinator != nil {
 		ws.AgentCoordinator.Cancel(sessionID)
 	}
 	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
 	shell.GetBackgroundShellManager().KillSession(ctx, sessionID)
 	cancel()
-	return nil
 }
 
 // SummarizeSession triggers a session summarization.

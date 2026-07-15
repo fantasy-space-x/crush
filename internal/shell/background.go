@@ -224,6 +224,12 @@ func (m *BackgroundShellManager) KillSession(ctx context.Context, sessionID stri
 	}
 	wg.Wait()
 
+	slog.Info("Cleaned up background shells for session",
+		"session_id", sessionID,
+		"cleaned_background_shells", len(shells),
+		"current_background_shells", m.shells.Len(),
+	)
+
 	return len(shells)
 }
 

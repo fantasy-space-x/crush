@@ -245,6 +245,9 @@ func runNonInteractive(
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to events: %w", err)
 	}
+	if err := c.SetCurrentSession(ctx, ws.ID, sess.ID); err != nil {
+		return fmt.Errorf("failed to set current session: %w", err)
+	}
 
 	// Mint a per-call RunID so we can correlate the terminal
 	// RunComplete with *this* SendMessage even if the session was
