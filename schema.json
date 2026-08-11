@@ -675,9 +675,11 @@
           "enum": [
             "low",
             "medium",
-            "high"
+            "high",
+            "xhigh",
+            "max"
           ],
-          "description": "Reasoning effort level for OpenAI models that support it"
+          "description": "Reasoning effort level for models that support it"
         },
         "think": {
           "type": "boolean",

@@ -251,8 +251,16 @@ func (c *Config) applyRuntimeModelOverride(override RuntimeModelOverride) error 
 		selected.MaxTokens = model.DefaultMaxTokens
 		selected.ReasoningEffort = model.DefaultReasoningEffort
 	}
-	c.Models[SelectedModelTypeLarge] = selected
-	c.Models[SelectedModelTypeSmall] = selected
+	large := selected
+	if configured := c.Models[SelectedModelTypeLarge]; configured.ReasoningEffort != "" {
+		large.ReasoningEffort = configured.ReasoningEffort
+	}
+	small := selected
+	if configured := c.Models[SelectedModelTypeSmall]; configured.ReasoningEffort != "" {
+		small.ReasoningEffort = configured.ReasoningEffort
+	}
+	c.Models[SelectedModelTypeLarge] = large
+	c.Models[SelectedModelTypeSmall] = small
 	return nil
 }
 

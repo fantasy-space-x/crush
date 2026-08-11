@@ -41,6 +41,34 @@ func TestConfig_LoadFromBytes(t *testing.T) {
 	require.Equal(t, "https://api.openai.com/v2", pc.BaseURL)
 }
 
+func TestConfigApplyRuntimeModelOverridePreservesReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{
+		Models: map[SelectedModelType]SelectedModel{
+			SelectedModelTypeLarge: {ReasoningEffort: "xhigh"},
+			SelectedModelTypeSmall: {ReasoningEffort: "low"},
+		},
+		Providers: csync.NewMap[string, ProviderConfig](),
+	}
+
+	err := cfg.applyRuntimeModelOverride(RuntimeModelOverride{
+		Model:   "deepseek-v4-flash",
+		BaseURL: "http://127.0.0.1:8080/v1",
+	})
+	require.NoError(t, err)
+
+	large := cfg.Models[SelectedModelTypeLarge]
+	require.Equal(t, "runtime", large.Provider)
+	require.Equal(t, "deepseek-v4-flash", large.Model)
+	require.Equal(t, "xhigh", large.ReasoningEffort)
+
+	small := cfg.Models[SelectedModelTypeSmall]
+	require.Equal(t, "runtime", small.Provider)
+	require.Equal(t, "deepseek-v4-flash", small.Model)
+	require.Equal(t, "low", small.ReasoningEffort)
+}
+
 func TestLookupConfigs_BoundedByProject(t *testing.T) {
 	// Force GlobalConfig and GlobalConfigData to point at locations we
 	// control so they can be present in the result without polluting

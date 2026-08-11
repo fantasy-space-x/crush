@@ -69,8 +69,8 @@ type SelectedModel struct {
 	// Required.
 	Provider string `json:"provider" jsonschema:"required,description=The model provider ID that matches a key in the providers config,example=openai"`
 
-	// Only used by models that use the openai provider and need this set.
-	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"description=Reasoning effort level for OpenAI models that support it,enum=low,enum=medium,enum=high"`
+	// Used by models that support configurable reasoning effort.
+	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"description=Reasoning effort level for models that support it,enum=low,enum=medium,enum=high,enum=xhigh,enum=max"`
 
 	// Used by anthropic models that can reason to indicate if the model should think.
 	Think bool `json:"think,omitempty" jsonschema:"description=Enable thinking mode for Anthropic models that support reasoning"`

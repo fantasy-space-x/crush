@@ -552,3 +552,28 @@ func TestGetProviderOptionsReasoningEffortFallback(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "enabled", thinking["type"])
 }
+
+func TestGetProviderOptionsRuntimeModelExplicitReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	model := Model{
+		CatwalkCfg: catwalk.Model{ID: "deepseek-v4-flash"},
+		ModelCfg: config.SelectedModel{
+			Provider:        "runtime",
+			ReasoningEffort: "xhigh",
+		},
+	}
+	providerCfg := config.ProviderConfig{
+		ID:   "runtime",
+		Type: openaicompat.Name,
+	}
+
+	opts := getProviderOptions(model, providerCfg)
+
+	raw, ok := opts[openaicompat.Name]
+	require.True(t, ok)
+	parsed, ok := raw.(*openaicompat.ProviderOptions)
+	require.True(t, ok)
+	require.NotNil(t, parsed.ReasoningEffort)
+	assert.Equal(t, "xhigh", string(*parsed.ReasoningEffort))
+}

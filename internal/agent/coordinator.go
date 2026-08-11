@@ -314,15 +314,19 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 }
 
 // effectiveReasoningEffort returns the reasoning effort to apply for provider calls.
-// It prefers the user-selected effort when valid, otherwise the model default when
-// valid, and finally falls back to the first configured reasoning level.
+// It prefers the user-selected effort when valid. Explicit effort is also
+// honored when capability metadata is unavailable, as with runtime models.
+// Otherwise it uses the model default or the first configured reasoning level.
 func effectiveReasoningEffort(model Model) string {
+	if effort := model.ModelCfg.ReasoningEffort; effort != "" {
+		if !model.CatwalkCfg.CanReason ||
+			len(model.CatwalkCfg.ReasoningLevels) == 0 ||
+			slices.Contains(model.CatwalkCfg.ReasoningLevels, effort) {
+			return effort
+		}
+	}
 	if !model.CatwalkCfg.CanReason {
 		return ""
-	}
-
-	if effort := model.ModelCfg.ReasoningEffort; effort != "" && slices.Contains(model.CatwalkCfg.ReasoningLevels, effort) {
-		return effort
 	}
 	if effort := model.CatwalkCfg.DefaultReasoningEffort; effort != "" && slices.Contains(model.CatwalkCfg.ReasoningLevels, effort) {
 		return effort
@@ -382,9 +386,7 @@ func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.
 	}
 
 	reasoningEffort := effectiveReasoningEffort(model)
-	shouldSetEffort := model.CatwalkCfg.CanReason &&
-		reasoningEffort != "" &&
-		slices.Contains(model.CatwalkCfg.ReasoningLevels, reasoningEffort)
+	shouldSetEffort := reasoningEffort != ""
 
 	switch providerCfg.Type {
 	case openai.Name, azure.Name:

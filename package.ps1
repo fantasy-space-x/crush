@@ -23,6 +23,7 @@ if ($version -ne "") {
 
 $targets = @(
 	@{ GOOS = "darwin"; GOARCH = "arm64"; Extension = "" },
+	@{ GOOS = "darwin"; GOARCH = "amd64"; Extension = "" },
 	@{ GOOS = "windows"; GOARCH = "amd64"; Extension = ".exe" },
 	@{ GOOS = "linux"; GOARCH = "amd64"; Extension = "" }
 )
