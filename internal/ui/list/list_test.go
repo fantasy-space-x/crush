@@ -768,3 +768,106 @@ func TestList_F7_ViewportZeroOrNegative(t *testing.T) {
 		})
 	}
 }
+
+// TestList_Prewarm covers incremental cache warming: Prewarm renders a
+// batch of items into the width cache so a later TotalHeight is free, and
+// re-setting the same width afterward must not drop that warmed cache.
+func TestList_Prewarm(t *testing.T) {
+	t.Parallel()
+
+	items := make([]Item, 6)
+	tracked := make([]*trackedItem, 6)
+	for i := range items {
+		it := newTrackedItem(strconv.Itoa(i), "body", true)
+		tracked[i] = it
+		items[i] = it
+	}
+	l := NewList(items...)
+	l.SetSize(40, 3)
+
+	// Warm the first three items; only those render.
+	next := l.Prewarm(0, 3)
+	require.Equal(t, 3, next)
+	for i := 0; i < 3; i++ {
+		require.Equal(t, 1, tracked[i].renderHits, "warmed item %d", i)
+	}
+	for i := 3; i < 6; i++ {
+		require.Equal(t, 0, tracked[i].renderHits, "unwarmed item %d", i)
+	}
+
+	// Warm the rest, then TotalHeight must not render anything again.
+	l.Prewarm(next, 3)
+	before := totalRenderHits(tracked)
+	_ = l.TotalHeight()
+	require.Equal(t, before, totalRenderHits(tracked), "TotalHeight re-rendered after full warm")
+
+	// Re-setting the same width is a no-op and must preserve the cache.
+	l.SetSize(40, 3)
+	_ = l.TotalHeight()
+	require.Equal(t, before, totalRenderHits(tracked), "same-width SetSize dropped the warmed cache")
+}
+
+// TestList_Overflows covers the cheap bounded overflow check: it stops
+// early once the viewport is exceeded and reports overflow correctly.
+func TestList_Overflows(t *testing.T) {
+	t.Parallel()
+
+	items := make([]Item, 10)
+	for i := range items {
+		items[i] = newTrackedItem(strconv.Itoa(i), "body", true) // 1 line each
+	}
+	l := NewList(items...)
+	l.SetSize(40, 4)
+
+	require.True(t, l.Overflows(4), "10 one-line items overflow a height of 4")
+	require.False(t, l.Overflows(20), "10 one-line items fit within a height of 20")
+}
+
+func totalRenderHits(items []*trackedItem) int {
+	n := 0
+	for _, it := range items {
+		n += it.renderHits
+	}
+	return n
+}
+
+// tallItem renders a fixed number of lines, so tests can build lists
+// whose first visible item is taller than the viewport.
+type tallItem struct {
+	*Versioned
+	lines int
+}
+
+func newTallItem(lines int) *tallItem {
+	return &tallItem{Versioned: NewVersioned(), lines: lines}
+}
+
+func (t *tallItem) Render(width int) string {
+	return strings.TrimSuffix(strings.Repeat("x\n", t.lines), "\n")
+}
+
+func (t *tallItem) Finished() bool { return false }
+
+// TestList_AtBottom_TallFirstVisibleItem covers the case where the item
+// at offsetIdx is taller than the viewport: the accumulated height passes
+// the viewport height long before the end of the list, but the lines
+// scrolled out of view (offsetLine) make up the difference. AtBottom must
+// account for offsetLine before bailing out early.
+func TestList_AtBottom_TallFirstVisibleItem(t *testing.T) {
+	t.Parallel()
+
+	for _, gap := range []int{0, 1} {
+		l := NewList(newTallItem(50), newTallItem(3))
+		l.SetGap(gap)
+		l.SetSize(40, 10)
+
+		l.ScrollToBottom()
+		require.True(t, l.AtBottom(), "gap=%d: at bottom after ScrollToBottom", gap)
+
+		l.ScrollBy(-1)
+		require.False(t, l.AtBottom(), "gap=%d: not at bottom after scrolling up", gap)
+
+		l.ScrollBy(1)
+		require.True(t, l.AtBottom(), "gap=%d: back at bottom after scrolling down", gap)
+	}
+}

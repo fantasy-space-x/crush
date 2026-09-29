@@ -3,6 +3,7 @@ package config
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -58,6 +59,7 @@ const (
 
 const (
 	AgentCoder string = "coder"
+	AgentPlan  string = "plan"
 	AgentTask  string = "task"
 )
 
@@ -130,6 +132,10 @@ type ProviderConfig struct {
 	// Used to pass extra parameters to the provider.
 	ExtraParams map[string]string `json:"-"`
 
+	// AWSAuthRefresh is a shell command run when Bedrock returns a
+	// credential error. Output is discarded to avoid corrupting the TUI.
+	AWSAuthRefresh string `json:"aws_auth_refresh,omitempty" jsonschema:"description=Shell command to run when AWS credentials expire (Bedrock only)."`
+
 	// Skip cost accumulation for this provider when using subscription or flat rate billing.
 	FlatRate bool `json:"flat_rate,omitempty" jsonschema:"description=Flat-rate mode for this provider"`
 
@@ -142,6 +148,12 @@ type ProviderConfig struct {
 
 	// The provider models
 	Models []catwalk.Model `json:"models,omitempty" jsonschema:"description=List of models available from this provider"`
+
+	// ChatGPTModels lists the models the ChatGPT (Codex) backend grants
+	// when the provider is authenticated with a ChatGPT account. It is
+	// the provider's whole catalog in that case: the API-key models in
+	// Models are not served by the subscription.
+	ChatGPTModels []catwalk.Model `json:"chatgpt_models,omitempty" jsonschema:"-"`
 }
 
 // ToProvider converts the [ProviderConfig] to a [catwalk.Provider].
@@ -178,6 +190,17 @@ func (c *ProviderConfig) SetupGitHubCopilot() {
 	maps.Copy(c.ExtraHeaders, copilot.Headers())
 }
 
+// HasAPIKey reports whether the provider's api_key resolves to a usable
+// credential. The stored value is often an unresolved template like
+// $OPENAI_API_KEY, which is not a credential until the variable exists.
+func (c *ProviderConfig) HasAPIKey(resolver VariableResolver) bool {
+	if c.APIKey == "" {
+		return false
+	}
+	v, err := resolver.ResolveValue(c.APIKey)
+	return err == nil && v != ""
+}
+
 type MCPType string
 
 const (
@@ -195,7 +218,20 @@ type MCPConfig struct {
 	Disabled      bool              `json:"disabled,omitempty" jsonschema:"description=Whether this MCP server is disabled,default=false"`
 	DisabledTools []string          `json:"disabled_tools,omitempty" jsonschema:"description=List of tools from this MCP server to disable,example=get-library-doc"`
 	EnabledTools  []string          `json:"enabled_tools,omitempty" jsonschema:"description=Allow list of tools from this MCP server,example=get-library-doc"`
-	Timeout       int               `json:"timeout,omitempty" jsonschema:"description=Timeout in seconds for MCP server connections,default=15,example=30,example=60,example=120"`
+	Timeout       int               `json:"timeout,omitempty" jsonschema:"description=Timeout in seconds for MCP server connections,default=10,example=30,example=60,example=120"`
+
+	// Sessionless marks a server that does not maintain an MCP session (it
+	// never issues a Mcp-Session-Id). When true, Crush omits the
+	// tools/prompts/resources list-changed handlers: the go-sdk opens a
+	// SEP-2575 "subscriptions/listen" stream whenever any of those handlers
+	// is set, and sessionless streamable-HTTP servers (e.g. GitHub MCP)
+	// answer that POST with 404 ("session not found"), which the SDK treats
+	// as fatal. The cost is no live list-changed notifications from this
+	// server.
+	//
+	// When nil, Crush auto-detects a set of known sessionless servers (see
+	// IsSessionless); set it explicitly to override that detection.
+	Sessionless *bool `json:"sessionless,omitempty" jsonschema:"description=Mark a sessionless MCP server (no Mcp-Session-Id) so Crush skips the subscriptions/listen stream it would otherwise reject. Leave unset to auto-detect known sessionless servers (e.g. GitHub MCP),default=false"`
 
 	// Headers are HTTP headers for HTTP/SSE MCP servers. Values run
 	// through shell expansion at MCP startup, so $VAR and $(cmd)
@@ -204,6 +240,86 @@ type MCPConfig struct {
 	// omitted from the outgoing request rather than sent as
 	// "Header:".
 	Headers map[string]string `json:"headers,omitempty" jsonschema:"description=HTTP headers for HTTP/SSE MCP servers"`
+
+	// OAuth enables the MCP OAuth 2.1 authorization flow for HTTP
+	// transport servers. When true, the client uses dynamic client
+	// registration and opens a browser for the user to authorize.
+	// Tokens are persisted automatically. Only supported for type=http.
+	OAuth bool `json:"oauth,omitempty" jsonschema:"description=Enable OAuth 2.1 authorization flow for this MCP server (HTTP transport only),default=false"`
+
+	// OAuthClientID is an optional pre-registered OAuth client ID. Set
+	// it for servers that do not support dynamic client registration
+	// (e.g. GitHub, Slack) and instead issue client credentials when you
+	// register an OAuth app. Values run through shell expansion, so
+	// $VAR and $(cmd) work.
+	OAuthClientID string `json:"oauth_client_id,omitempty" jsonschema:"description=Pre-registered OAuth client ID for servers without dynamic client registration"`
+
+	// OAuthClientSecret is the optional secret paired with
+	// OAuthClientID for confidential clients. Values run through shell
+	// expansion, so $VAR and $(cmd) work.
+	OAuthClientSecret string `json:"oauth_client_secret,omitempty" jsonschema:"description=Pre-registered OAuth client secret paired with oauth_client_id"`
+
+	// OAuthCallbackPort pins the localhost port used for the OAuth
+	// redirect listener. Set this when the OAuth provider requires an
+	// exact-match callback URL (e.g. GitHub OAuth Apps). When omitted,
+	// Crush picks the first free port from its default range.
+	OAuthCallbackPort int `json:"oauth_callback_port,omitempty" jsonschema:"description=Fixed localhost port for the OAuth callback, required by providers that enforce exact-match redirect URIs"`
+
+	// OAuthToken is the persisted OAuth token for this server. It is
+	// managed internally and stored in the global data config.
+	OAuthToken *oauth.Token `json:"oauth_token,omitempty" jsonschema:"-"`
+
+	// ChannelEnabled enables an MCP server as a channel directly from config,
+	// equivalent to passing its name via --channels on the CLI. This lets
+	// channels be declared persistently in crush.json without needing a CLI
+	// flag on every launch.
+	ChannelEnabled bool `json:"channel_enabled,omitempty" jsonschema:"description=Enable this MCP server as a channel (equivalent to --channels),default=false"`
+
+	// ChannelReply, when set on a server enabled as a channel, makes Crush
+	// route the final assistant response of every turn that originated from
+	// this channel back through one of the server's own tools, so a message
+	// received on the channel gets a reply on the channel even when the
+	// model only produced terminal output.
+	ChannelReply *MCPChannelReply `json:"channel_reply,omitempty" jsonschema:"description=Automatically route replies for turns originating from this channel back through one of the server's tools"`
+}
+
+// MCPChannelReply configures deterministic reply routing for an MCP server
+// acting as a channel: which of the server's tools deliver a reply for
+// direct and group pushes, and how the reply text and target are mapped
+// onto tool arguments.
+type MCPChannelReply struct {
+	// User routes replies to direct (person-to-person) channel pushes.
+	User *MCPChannelReplyRoute `json:"user,omitempty" jsonschema:"description=Reply route for direct messages"`
+	// Group routes replies to group channel pushes. It is preferred over
+	// User when the push carries the group route's meta attribute.
+	Group *MCPChannelReplyRoute `json:"group,omitempty" jsonschema:"description=Reply route for group messages"`
+	// MessageParam is the tool argument that receives the reply text.
+	MessageParam string `json:"message_param,omitempty" jsonschema:"description=Tool argument name that receives the reply text,default=message"`
+	// SuppressTools lists additional tool names (beyond the two route
+	// tools) that count as the model having already replied on the channel
+	// during the turn, e.g. an operator-shortcut send tool.
+	SuppressTools []string `json:"suppress_tools,omitempty" jsonschema:"description=Additional tool names that suppress the automatic reply when the model already called one of them during the turn,example=send"`
+}
+
+// MCPChannelReplyRoute maps one kind of inbound channel push onto the MCP
+// tool call that delivers a reply to it.
+type MCPChannelReplyRoute struct {
+	// Tool is the MCP tool (bare name, without the mcp_<server>_ prefix)
+	// invoked to deliver the reply.
+	Tool string `json:"tool" jsonschema:"required,description=MCP tool name that sends the reply,example=send_message_to_user"`
+	// TargetParam is the tool argument that receives the reply target
+	// (recipient or group ID).
+	TargetParam string `json:"target_param" jsonschema:"required,description=Tool argument name that receives the reply target,example=user_id"`
+	// TargetMeta is the <channel> meta attribute whose value identifies
+	// the reply target. Defaults to "sender" for the user route and
+	// "group" for the group route.
+	TargetMeta string `json:"target_meta,omitempty" jsonschema:"description=Channel meta attribute carrying the reply target; defaults to sender (user route) or group (group route)"`
+}
+
+// isOrphanedToken reports whether this entry is a leftover OAuth token
+// with no real server config.
+func (m MCPConfig) isOrphanedToken() bool {
+	return m.Type == "" && m.Command == "" && m.URL == "" && m.OAuthToken != nil
 }
 
 type LSPConfig struct {
@@ -219,14 +335,52 @@ type LSPConfig struct {
 }
 
 type TUIOptions struct {
-	CompactMode bool   `json:"compact_mode,omitempty" jsonschema:"description=Enable compact mode for the TUI interface,default=false"`
-	DiffMode    string `json:"diff_mode,omitempty" jsonschema:"description=Diff mode for the TUI interface,enum=unified,enum=split"`
-	// Here we can add themes later or any TUI related options
-	//
-
+	CompactMode bool        `json:"compact_mode,omitempty" jsonschema:"description=Enable compact mode for the TUI interface,default=false"`
+	DiffMode    string      `json:"diff_mode,omitempty" jsonschema:"description=Diff mode for the TUI interface,enum=unified,enum=split"`
+	ActiveTheme string      `json:"active_theme,omitempty" jsonschema:"description=Name of the currently active theme,default=charmtone-panther,example=charmtone-panther,example=gruvbox-dark"`
 	Completions Completions `json:"completions,omitzero" jsonschema:"description=Completions UI options"`
 	Transparent *bool       `json:"transparent,omitempty" jsonschema:"description=Enable transparent background for the TUI interface,default=false"`
 	Scrollbar   string      `json:"scrollbar,omitempty" jsonschema:"description=Chat scrollbar visibility,enum=default,enum=always,enum=never,default=default"`
+	Mouse       *bool       `json:"mouse,omitempty" jsonschema:"description=Enable terminal mouse capture for selection\\, clicks\\, and scrolling in the TUI. Disable to let the terminal emulator or tmux handle text selection and copy/paste,default=true"`
+	ExitBanner  ExitBanner  `json:"exit_banner,omitempty" jsonschema:"description=Exit banner style after quitting Crush,enum=default,enum=compact,enum=none,default=default"`
+}
+
+// IsTransparent reports whether the TUI draws a transparent background. The
+// nil receiver and the unset pointer both mean opaque, so callers can ask
+// without unwrapping either.
+func (t *TUIOptions) IsTransparent() bool {
+	return t != nil && t.Transparent != nil && *t.Transparent
+}
+
+// UnmarshalJSON tolerates the legacy string form of the "theme" field.
+// Older Crush builds stored the selected theme as `"theme":
+// "gruvbox-dark"`. When that string is encountered it is promoted to the
+// active theme name so existing configs keep loading.
+func (t *TUIOptions) UnmarshalJSON(data []byte) error {
+	type tuiOptionsAlias TUIOptions
+	var loose struct {
+		tuiOptionsAlias
+		Theme json.RawMessage `json:"theme"`
+	}
+	if err := json.Unmarshal(data, &loose); err != nil {
+		return err
+	}
+	*t = TUIOptions(loose.tuiOptionsAlias)
+	if len(loose.Theme) == 0 || string(loose.Theme) == "null" {
+		return nil
+	}
+
+	var legacyName string
+	if err := json.Unmarshal(loose.Theme, &legacyName); err != nil {
+		// Legacy inline theme maps are ignored now that files are the only
+		// palette source, but they must remain loadable during migration.
+		var legacyThemes map[string]json.RawMessage
+		return json.Unmarshal(loose.Theme, &legacyThemes)
+	}
+	if legacyName != "" && t.ActiveTheme == "" {
+		t.ActiveTheme = legacyName
+	}
+	return nil
 }
 
 // Completions defines options for the completions UI.
@@ -235,15 +389,38 @@ type Completions struct {
 	MaxItems *int `json:"max_items,omitempty" jsonschema:"description=Maximum number of items to return for the ls tool,default=1000,example=100"`
 }
 
+// Limits returns the configured completion limits. Zero means the user has not
+// pinned that limit, and callers fall back to their own built-in cap.
 func (c Completions) Limits() (depth, items int) {
 	return ptrValOr(c.MaxDepth, 0), ptrValOr(c.MaxItems, 0)
 }
+
+// Diff mode options.
+const (
+	DiffModeUnified = "unified" // Inline unified diffs
+	DiffModeSplit   = "split"   // Side-by-side diffs
+)
 
 // Scrollbar visibility options.
 const (
 	ScrollbarDefault = "default" // Auto-hide after 2 seconds
 	ScrollbarAlways  = "always"  // Always show when content exceeds viewport
 	ScrollbarNever   = "never"   // Never show scrollbar
+)
+
+// ExitBanner selects what Crush prints after the TUI exits.
+type ExitBanner string
+
+const (
+	// ExitBannerDefault renders the full ASCII art logo with padding. It is
+	// also what the zero value and any unrecognized value fall back to.
+	ExitBannerDefault ExitBanner = "default"
+	// ExitBannerCompact renders only the session and resume lines, with no
+	// logo and no padding. With no active session it renders nothing at all,
+	// so Crush exits silently.
+	ExitBannerCompact ExitBanner = "compact"
+	// ExitBannerNone renders nothing.
+	ExitBannerNone ExitBanner = "none"
 )
 
 type Permissions struct {
@@ -294,9 +471,31 @@ type Options struct {
 	InitializeAs              string       `json:"initialize_as,omitempty" jsonschema:"description=Name of the context file to create/update during project initialization,default=AGENTS.md,example=AGENTS.md,example=CRUSH.md,example=CLAUDE.md,example=docs/LLMs.md"`
 	AutoLSP                   *bool        `json:"auto_lsp,omitempty" jsonschema:"description=Automatically setup LSPs based on root markers,default=true"`
 	Progress                  *bool        `json:"progress,omitempty" jsonschema:"description=Show indeterminate progress updates during long operations,default=true"`
-	DisableNotifications      bool         `json:"disable_notifications,omitempty" jsonschema:"description=Deprecated: Use notification_style instead. Disable desktop notifications,default=false"`
-	NotificationStyle         string       `json:"notification_style,omitempty" jsonschema:"description=Notification style to use. Options: auto (default), native, osc, bell, disabled. Auto selects based on environment: native for local sessions, osc for SSH (with automatic OSC 99/777 detection).,enum=auto,enum=native,enum=osc,enum=bell,enum=disabled,default=auto"`
+	Notifications             string       `json:"notifications,omitempty" jsonschema:"description=Notification style to use. Options: auto (default)\\, native\\, osc\\, bell\\, disabled. Auto selects based on environment: native for local sessions\\, osc for SSH (with automatic OSC 99/777 detection).,enum=auto,enum=native,enum=osc,enum=bell,enum=disabled,default=auto"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
+	RequestTimeout            *int         `json:"request_timeout,omitempty" jsonschema:"description=Timeout in seconds for each LLM API request. Streaming responses are aborted only after this much inactivity\\, so slow but active streams are never killed. 0 disables it\\, negative values are invalid.,default=60,example=120,example=300,example=0"`
+}
+
+// DefaultRequestTimeout bounds each LLM API request when the user has not
+// configured a timeout. Slow or unreachable providers fail after it instead
+// of blocking a session forever; streamed responses are only aborted after
+// this much inactivity, and users running slow local models can raise or
+// disable it via options.request_timeout.
+const DefaultRequestTimeout = 2 * time.Minute
+
+// GetRequestTimeout returns the per-request timeout for LLM API calls (a
+// hard deadline for non-streaming requests and an idle timeout for
+// streams), or zero when disabled. The nil receiver and the unset field
+// both mean DefaultRequestTimeout, so callers can ask without unwrapping
+// either.
+func (o *Options) GetRequestTimeout() time.Duration {
+	if o == nil || o.RequestTimeout == nil {
+		return DefaultRequestTimeout
+	}
+	if *o.RequestTimeout <= 0 {
+		return 0
+	}
+	return time.Duration(*o.RequestTimeout) * time.Second
 }
 
 type MCPs map[string]MCPConfig
@@ -401,6 +600,33 @@ func (m MCPConfig) ResolvedURL(r VariableResolver) (string, error) {
 		return "", fmt.Errorf("url: %w", err)
 	}
 	return v, nil
+}
+
+// knownSessionlessMCPs is the set of MCP endpoint URLs (normalized, no
+// trailing slash) that are known not to maintain an MCP session — they
+// never issue a Mcp-Session-Id and reject the SEP-2575
+// "subscriptions/listen" stream. Add an entry when a server is confirmed to
+// behave this way.
+var knownSessionlessMCPs = map[string]struct{}{
+	"https://api.github.com/mcp":        {},
+	"https://api.githubcopilot.com/mcp": {},
+}
+
+// IsSessionless reports whether the server should be treated as sessionless.
+// An explicit Sessionless value wins; when unset, the resolved URL is matched
+// against knownSessionlessMCPs (trailing slash ignored). The URL is resolved
+// through r so $VAR-expanded endpoints are detected too; on a resolution
+// error the explicit value (or false) is used.
+func (m MCPConfig) IsSessionless(r VariableResolver) bool {
+	if m.Sessionless != nil {
+		return *m.Sessionless
+	}
+	url, err := m.ResolvedURL(r)
+	if err != nil {
+		return false
+	}
+	_, ok := knownSessionlessMCPs[strings.TrimSuffix(url, "/")]
+	return ok
 }
 
 // ResolvedHeaders returns m.Headers with every value expanded through
@@ -624,6 +850,9 @@ type Config struct {
 
 	Hooks map[string][]HookConfig `json:"hooks,omitempty" jsonschema:"description=User-defined shell commands that fire on hook events (e.g. PreToolUse)"`
 
+	// Env is a map of environment variables set on startup.
+	Env map[string]string `json:"env,omitempty" jsonschema:"description=Environment variables to set on startup"`
+
 	Agents map[string]Agent `json:"-"`
 }
 
@@ -688,8 +917,48 @@ func (c *Config) GetModel(provider, model string) *catwalk.Model {
 				return &m
 			}
 		}
+		for _, m := range providerConfig.ChatGPTModels {
+			if m.ID == model {
+				return &m
+			}
+		}
 	}
 	return nil
+}
+
+// ValidateReasoningEffort checks that effort is a reasoning level the
+// given provider/model supports. It returns an error listing the accepted
+// levels when the model cannot use it.
+func (c *Config) ValidateReasoningEffort(provider, modelID, effort string) error {
+	model := c.GetModel(provider, modelID)
+	if model == nil {
+		return fmt.Errorf("model %q not found for provider %q", modelID, provider)
+	}
+	if len(model.ReasoningLevels) == 0 {
+		return fmt.Errorf("model %q does not support reasoning effort", modelID)
+	}
+	if slices.Contains(model.ReasoningLevels, effort) {
+		return nil
+	}
+	return fmt.Errorf(
+		"model %q does not support reasoning effort %q, accepted values: %s",
+		modelID, effort, strings.Join(model.ReasoningLevels, ", "),
+	)
+}
+
+// IsModelAvailable returns true if the provider is enabled and the model
+// exists in its catalog. Unlike GetModel, it rejects disabled providers.
+func (c *Config) IsModelAvailable(provider, model string) bool {
+	providerConfig, ok := c.Providers.Get(provider)
+	if !ok || providerConfig.Disable {
+		return false
+	}
+	for _, m := range providerConfig.Models {
+		if m.ID == model {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) GetProviderForModel(modelType SelectedModelType) *ProviderConfig {
@@ -743,11 +1012,17 @@ func allToolNames() []string {
 		"lsp_diagnostics",
 		"lsp_references",
 		"lsp_restart",
+		"lsp_symbols",
+		"lsp_definition",
+		"lsp_call_hierarchy",
+		"lsp_rename",
+		"lsp_replace_symbol",
 		"fetch",
 		"agentic_fetch",
 		"glob",
 		"grep",
 		"ls",
+		"question",
 		"sourcegraph",
 		"todos",
 		"view",
@@ -766,9 +1041,27 @@ func resolveAllowedTools(allTools []string, disabledTools []string) []string {
 }
 
 func resolveReadOnlyTools(tools []string) []string {
-	readOnlyTools := []string{"glob", "grep", "ls", "sourcegraph", "view"}
+	readOnlyTools := []string{"glob", "grep", "ls", "lsp_call_hierarchy", "lsp_definition", "lsp_symbols", "sourcegraph", "view"}
 	// filter to only include tools that are in allowedtools (include mode)
 	return filterSlice(tools, readOnlyTools, true)
+}
+
+func resolvePlanTools(tools []string) []string {
+	// The read-only LSP lookups mirror the task agent's tool set: planning
+	// needs symbol navigation just as much as research does.
+	planTools := []string{
+		"agent",
+		"glob",
+		"grep",
+		"ls",
+		"lsp_call_hierarchy",
+		"lsp_definition",
+		"lsp_symbols",
+		"question",
+		"sourcegraph",
+		"view",
+	}
+	return filterSlice(tools, planTools, true)
 }
 
 func filterSlice(data []string, mask []string, include bool) []string {
@@ -803,6 +1096,17 @@ func (c *Config) SetupAgents() {
 			Model:        SelectedModelTypeLarge,
 			ContextPaths: c.Options.ContextPaths,
 			AllowedTools: resolveReadOnlyTools(allowedTools),
+			// NO MCPs or LSPs by default
+			AllowedMCP: map[string][]string{},
+		},
+
+		AgentPlan: {
+			ID:           AgentPlan,
+			Name:         "Plan",
+			Description:  "An agent that performs deep analysis and prepares implementation plans without modifying files.",
+			Model:        SelectedModelTypeLarge,
+			ContextPaths: c.Options.ContextPaths,
+			AllowedTools: resolvePlanTools(allowedTools),
 			// NO MCPs or LSPs by default
 			AllowedMCP: map[string][]string{},
 		},

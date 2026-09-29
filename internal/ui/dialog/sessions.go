@@ -2,7 +2,9 @@ package dialog
 
 import (
 	"context"
+	"image"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
@@ -18,6 +20,8 @@ import (
 
 // SessionsID is the identifier for the session selector dialog.
 const SessionsID = "session"
+
+const sessionDoubleClickThreshold = 400 * time.Millisecond
 
 type sessionsMode uint8
 
@@ -37,7 +41,11 @@ type Session struct {
 	selectedSessionInx int
 	sessions           []session.Session
 
-	sessionsMode sessionsMode
+	sessionsMode  sessionsMode
+	bodyArea      image.Rectangle
+	mouseScrolled bool
+	lastClickTime time.Time
+	lastClickID   string
 
 	keyMap struct {
 		Select        key.Binding
@@ -121,7 +129,7 @@ func NewSessions(com *common.Common, selectedSessionID string) (*Session, error)
 		key.WithHelp("esc", "cancel"),
 	)
 	s.keyMap.ConfirmDelete = key.NewBinding(
-		key.WithKeys("y"),
+		key.WithKeys("y", "enter"),
 		key.WithHelp("y", "delete"),
 	)
 	s.keyMap.CancelDelete = key.NewBinding(
@@ -148,8 +156,6 @@ func (s *Session) HandleMsg(msg tea.Msg) Action {
 			case key.Matches(msg, s.keyMap.ConfirmDelete):
 				action := s.confirmDeleteSession()
 				s.list.SetItems(sessionItems(s.com.Styles, sessionsModeNormal, s.sessions...)...)
-				s.list.SelectFirst()
-				s.list.ScrollToSelected()
 				return action
 			case key.Matches(msg, s.keyMap.CancelDelete):
 				s.sessionsMode = sessionsModeNormal
@@ -208,17 +214,61 @@ func (s *Session) HandleMsg(msg tea.Msg) Action {
 					return ActionSelectSession{sessionItem.Session}
 				}
 			default:
+				prevValue := s.input.Value()
 				var cmd tea.Cmd
 				s.input, cmd = s.input.Update(msg)
 				value := s.input.Value()
-				s.list.SetFilter(value)
-				s.list.ScrollToTop()
-				s.list.SetSelected(0)
+				if value != prevValue {
+					s.list.SetFilter(value)
+					s.list.ScrollToTop()
+					s.list.SetSelected(0)
+				}
 				return ActionCmd{cmd}
 			}
 		}
+	case common.CoalescedWheelMsg:
+		if image.Pt(msg.Mouse.X, msg.Mouse.Y).In(s.sessionListArea()) {
+			s.list.ScrollBy(int(msg.DeltaY))
+			s.mouseScrolled = true
+		}
+	case tea.MouseClickMsg:
+		return s.handleMouseClick(msg)
 	}
 	return nil
+}
+
+func (s *Session) handleMouseClick(msg tea.MouseClickMsg) Action {
+	if msg.Button != tea.MouseLeft || s.sessionsMode != sessionsModeNormal {
+		s.resetMouseClick()
+		return nil
+	}
+	area := s.sessionListArea()
+	area.Max.X = min(area.Max.X, area.Min.X+s.list.Width())
+	point := image.Pt(msg.X, msg.Y)
+	if !point.In(area) {
+		s.resetMouseClick()
+		return nil
+	}
+	index, _ := s.list.ItemIndexAtPosition(point.X-area.Min.X, point.Y-area.Min.Y)
+	if index < 0 {
+		s.resetMouseClick()
+		return nil
+	}
+	sessionItem := s.list.ItemAt(index).(*SessionItem)
+	now := time.Now()
+	if s.lastClickID == sessionItem.ID() && now.Sub(s.lastClickTime) <= sessionDoubleClickThreshold {
+		s.resetMouseClick()
+		return ActionSelectSession{sessionItem.Session}
+	}
+	s.lastClickTime = now
+	s.lastClickID = sessionItem.ID()
+	s.list.SetSelected(index)
+	return nil
+}
+
+func (s *Session) resetMouseClick() {
+	s.lastClickTime = time.Time{}
+	s.lastClickID = ""
 }
 
 // Cursor returns the cursor position relative to the dialog.
@@ -229,25 +279,21 @@ func (s *Session) Cursor() *tea.Cursor {
 // Draw implements [Dialog].
 func (s *Session) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 	t := s.com.Styles
+	s.bodyArea = image.Rectangle{}
 	width := max(0, min(defaultDialogMaxWidth, area.Dx()-t.Dialog.View.GetHorizontalBorderSize()))
 	height := max(0, min(defaultDialogHeight, area.Dy()-t.Dialog.View.GetVerticalBorderSize()))
 	innerWidth := width - t.Dialog.View.GetHorizontalFrameSize()
-	heightOffset := t.Dialog.Title.GetVerticalFrameSize() + titleContentHeight +
-		t.Dialog.InputPrompt.GetVerticalFrameSize() + inputContentHeight +
-		t.Dialog.HelpView.GetVerticalFrameSize() +
-		t.Dialog.View.GetVerticalFrameSize()
-	s.input.SetWidth(max(0, innerWidth-t.Dialog.InputPrompt.GetHorizontalFrameSize()-1)) // (1) cursor padding
-	listHeight := height - heightOffset
-	listTotalHeight := s.list.TotalHeight()
-	listWidth := max(0, innerWidth-3) // Reserve space for scrollbar.
-	s.list.SetSize(listWidth, listHeight)
-	s.help.SetWidth(innerWidth)
+	s.input.SetWidth(dialogInputTextWidth(t, s.input, innerWidth))
+	listHeight, listTotalHeight, listWidth := sizeDialogList(t, s.list, innerWidth, height)
+
+	// Hide the timestamps uniformly when the widest would crowd the title.
+	applyInfoColumnVisibility(s.list.FilteredItems(), listWidth, sessionInfoMaxPercent)
 
 	// This makes it so we do not scroll the list if we don't have to
 	start, end := s.list.VisibleItemIndices()
 
 	// if selected index is outside visible range, scroll to it
-	if s.selectedSessionInx < start || s.selectedSessionInx > end {
+	if !s.mouseScrolled && (s.selectedSessionInx < start || s.selectedSessionInx > end) {
 		s.list.ScrollToSelected()
 	}
 
@@ -273,56 +319,66 @@ func (s *Session) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 			return nil
 		}
 		cur = item.Cursor()
-		if cur == nil {
-			break
-		}
-
 		start, end := s.list.VisibleItemIndices()
-		selectedIndex := s.list.Selected()
-
-		titleStyle := t.Dialog.Sessions.RenamingingTitle
-		dialogStyle := t.Dialog.Sessions.RenamingView
-		inputStyle := t.Dialog.InputPrompt
-
-		// Adjust cursor position to account for dialog layout + message
-		cur.X += inputStyle.GetBorderLeftSize() +
-			inputStyle.GetMarginLeft() +
-			inputStyle.GetPaddingLeft() +
-			dialogStyle.GetBorderLeftSize() +
-			dialogStyle.GetPaddingLeft() +
-			dialogStyle.GetMarginLeft()
-		cur.Y += titleStyle.GetVerticalFrameSize() +
-			inputStyle.GetBorderTopSize() +
-			inputStyle.GetMarginTop() +
-			inputStyle.GetPaddingTop() +
-			inputStyle.GetBorderBottomSize() +
-			inputStyle.GetMarginBottom() +
-			inputStyle.GetPaddingBottom() +
-			dialogStyle.GetPaddingTop() +
-			dialogStyle.GetBorderTopSize() +
-			lipgloss.Height(message) - 1
-
-		// move the cursor by one down until we see the selectedIndex
-		for ; start <= end && start != selectedIndex && selectedIndex > -1; start++ {
-			cur.Y += 1
-		}
+		cur = renameCursorOffset(t, cur, lipgloss.Height(message), start, end, s.list.Selected())
 	default:
 		inputView := t.Dialog.InputPrompt.Render(s.input.View())
 		cur = s.Cursor()
 		rc.AddPart(inputView)
 	}
-	listView := t.Dialog.List.Height(s.list.Height()).Render(s.list.Render())
-	scrollbar := common.Scrollbar(t, listHeight, listTotalHeight, listHeight, s.list.Offset())
-	if scrollbar != "" {
-		listView = lipgloss.JoinHorizontal(lipgloss.Top, listView, scrollbar)
-	}
-	rc.AddPart(listView)
-	rc.Help = s.help.View(s)
+	bodyView := t.Dialog.List.Height(s.list.Height()).Render(s.list.Render())
+	bodyView = joinScrollbar(t, bodyView, listHeight, listTotalHeight, listHeight, s.list.Offset())
+	rc.AddPart(bodyView)
+	rc.Help = renderDialogHelp(t, &s.help, s, innerWidth)
 
 	view := rc.Render()
+	s.updateSessionListArea(area, view, bodyView, rc.Help, rc.ViewStyle, t.Dialog.List, innerWidth, listHeight)
 
 	DrawCenterCursor(scr, area, view, cur)
 	return cur
+}
+
+func (s *Session) updateSessionListArea(
+	area uv.Rectangle,
+	view string,
+	bodyView string,
+	helpView string,
+	viewStyle lipgloss.Style,
+	bodyStyle lipgloss.Style,
+	bodyWidth int,
+	bodyHeight int,
+) {
+	viewWidth, viewHeight := lipgloss.Size(view)
+	dialogArea := common.CenterRect(area, min(viewWidth, area.Dx()), min(viewHeight, area.Dy()))
+	bodyViewTop := dialogArea.Max.Y -
+		viewStyle.GetMarginBottom() -
+		viewStyle.GetBorderBottomSize() -
+		viewStyle.GetPaddingBottom() -
+		lipgloss.Height(helpView) -
+		lipgloss.Height(bodyView)
+	bodyMin := image.Pt(
+		dialogArea.Min.X+
+			viewStyle.GetMarginLeft()+
+			viewStyle.GetBorderLeftSize()+
+			viewStyle.GetPaddingLeft()+
+			bodyStyle.GetMarginLeft()+
+			bodyStyle.GetBorderLeftSize()+
+			bodyStyle.GetPaddingLeft(),
+		bodyViewTop+
+			bodyStyle.GetMarginTop()+
+			bodyStyle.GetBorderTopSize()+
+			bodyStyle.GetPaddingTop(),
+	)
+	s.bodyArea = image.Rect(
+		bodyMin.X,
+		bodyMin.Y,
+		bodyMin.X+bodyWidth,
+		bodyMin.Y+bodyHeight,
+	).Intersect(dialogArea).Intersect(area)
+}
+
+func (s *Session) sessionListArea() image.Rectangle {
+	return s.bodyArea
 }
 
 func (s *Session) selectedSessionItem() *SessionItem {

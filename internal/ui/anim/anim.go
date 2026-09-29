@@ -11,7 +11,6 @@ import (
 
 	"github.com/zeebo/xxh3"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/lucasb-eyer/go-colorful"
 
@@ -52,7 +51,6 @@ const (
 var (
 	defaultGradColorA = color.RGBA{R: 0xff, G: 0, B: 0, A: 0xff}
 	defaultGradColorB = color.RGBA{R: 0, G: 0, B: 0xff, A: 0xff}
-	defaultLabelColor = color.RGBA{R: 0xcc, G: 0xcc, B: 0xcc, A: 0xff}
 )
 
 var (
@@ -60,8 +58,8 @@ var (
 	ellipsisFrames = []string{".", "..", "...", ""}
 )
 
-// Internal ID management. Used during animating to ensure that frame messages
-// are received only by spinner components that sent them.
+// Internal ID management. The ID seeds the deterministic birth schedule so
+// two spinners built from the same settings do not animate in lockstep.
 var lastID atomic.Int64
 
 func nextID() int {
@@ -83,13 +81,17 @@ var animCacheMap = csync.NewMap[string, *animCache]()
 // settingsHash creates a hash key for the settings to use for caching
 func settingsHash(opts Settings) string {
 	h := xxh3.New()
-	fmt.Fprintf(h, "%d-%s-%v-%v-%v-%t",
-		opts.Size, opts.Label, opts.LabelColor, opts.GradColorA, opts.GradColorB, opts.CycleColors)
+	fmt.Fprintf(h, "%d-%s-%v-%v-%v-%t-%v",
+		opts.Size, opts.Label, opts.LabelColor, opts.GradColorA, opts.GradColorB, opts.CycleColors, opts.SuffixColor)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// StepMsg is a message type used to trigger the next step in the animation.
-type StepMsg struct{ ID string }
+// FrameInterval returns how long each animation frame stays on screen. The
+// UI drives every Anim from one clock ticking at this interval; Anim
+// instances never schedule themselves.
+func FrameInterval() time.Duration {
+	return time.Second / time.Duration(fps)
+}
 
 // Settings defines settings for the animation.
 type Settings struct {
@@ -106,6 +108,14 @@ type Settings struct {
 	// animated ellipsis are visible. Useful for non-LLM contexts where
 	// scrambled glyphs imply "thinking" rather than "running".
 	NoScramble bool
+
+	// Suffix is an optional function that returns a dynamic suffix string
+	// to render after the label and ellipsis. Called on every Render().
+	Suffix func() string
+
+	// SuffixColor is the color used to render the suffix text.
+	// Falls back to LabelColor if unset.
+	SuffixColor color.Color
 }
 
 // Default settings.
@@ -123,10 +133,12 @@ type Anim struct {
 	initialized      atomic.Bool
 	cyclingFrames    [][]string           // frames for the cycling characters
 	step             atomic.Int64         // current main frame step (wraps)
-	framesSinceStart atomic.Int64         // total Animate ticks (does not wrap)
+	framesSinceStart atomic.Int64         // total Advance frames (does not wrap)
 	ellipsisStep     atomic.Int64         // current ellipsis frame step
 	ellipsisFrames   *csync.Slice[string] // ellipsis animation frames
 	id               string
+	suffix           func() string
+	suffixColor      color.Color
 }
 
 // New creates a new Anim instance with the specified width and label.
@@ -142,9 +154,9 @@ func New(opts Settings) *Anim {
 	if colorIsUnset(opts.GradColorB) {
 		opts.GradColorB = defaultGradColorB
 	}
-	if colorIsUnset(opts.LabelColor) {
-		opts.LabelColor = defaultLabelColor
-	}
+	// A nil LabelColor means "use the terminal default foreground".
+	// No fallback is applied so non-interactive callers can opt out
+	// of explicit coloring.
 
 	if opts.ID != "" {
 		a.id = opts.ID
@@ -157,6 +169,16 @@ func New(opts Settings) *Anim {
 		a.cyclingCharWidth = opts.Size
 	}
 	a.labelColor = opts.LabelColor
+
+	// Store the suffix function if provided.
+	if opts.Suffix != nil {
+		a.suffix = opts.Suffix
+	}
+	if opts.SuffixColor != nil {
+		a.suffixColor = opts.SuffixColor
+	} else {
+		a.suffixColor = opts.LabelColor
+	}
 
 	// NoScramble means no cycling chars and no birth animation. Mark as
 	// initialized immediately so the label renders without a fade-in.
@@ -360,17 +382,10 @@ func (a *Anim) Width() (w int) {
 	return w
 }
 
-// Start starts the animation.
-func (a *Anim) Start() tea.Cmd {
-	return a.Step()
-}
-
-// Animate advances the animation to the next step.
-func (a *Anim) Animate(msg StepMsg) tea.Cmd {
-	if msg.ID != a.id {
-		return nil
-	}
-
+// Advance moves the animation forward by one frame. It is called by the
+// UI's shared animation clock for every visible spinner; the Anim itself
+// never schedules ticks.
+func (a *Anim) Advance() bool {
 	step := a.step.Add(1)
 	if int(step) >= len(a.cyclingFrames) {
 		a.step.Store(0)
@@ -386,7 +401,7 @@ func (a *Anim) Animate(msg StepMsg) tea.Cmd {
 	} else if !a.initialized.Load() && int(frames) >= maxBirthSteps {
 		a.initialized.Store(true)
 	}
-	return a.Step()
+	return true
 }
 
 // Render renders the current state of the animation.
@@ -417,22 +432,33 @@ func (a *Anim) Render() string {
 		}
 	}
 	// Render animated ellipsis at the end of the label if all characters
-	// have been initialized.
+	// have been initialized. Skip when a suffix is active to avoid visual
+	// competition between the animated dots and the timer.
 	if a.initialized.Load() && a.labelWidth > 0 {
-		ellipsisStep := int(a.ellipsisStep.Load())
-		if ellipsisFrame, ok := a.ellipsisFrames.Get(ellipsisStep / ellipsisAnimSpeed); ok {
-			b.WriteString(ellipsisFrame)
+		showEllipsis := true
+		if a.suffix != nil {
+			if s := a.suffix(); s != "" {
+				showEllipsis = false
+			}
+		}
+		if showEllipsis {
+			ellipsisStep := int(a.ellipsisStep.Load())
+			if ellipsisFrame, ok := a.ellipsisFrames.Get(ellipsisStep / ellipsisAnimSpeed); ok {
+				b.WriteString(ellipsisFrame)
+			}
+		}
+	}
+
+	// Render optional suffix (e.g., elapsed time).
+	if a.suffix != nil {
+		suffixStr := a.suffix()
+		if suffixStr != "" {
+			b.WriteString(" ")
+			b.WriteString(lipgloss.NewStyle().Foreground(a.suffixColor).Render(suffixStr))
 		}
 	}
 
 	return b.String()
-}
-
-// Step is a command that triggers the next step in the animation.
-func (a *Anim) Step() tea.Cmd {
-	return tea.Tick(time.Second/time.Duration(fps), func(t time.Time) tea.Msg {
-		return StepMsg{ID: a.id}
-	})
 }
 
 // makeGradientRamp() returns a slice of colors blended between the given keys.

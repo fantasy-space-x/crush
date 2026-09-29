@@ -15,6 +15,7 @@ const (
 	MCPStateStarting
 	MCPStateConnected
 	MCPStateError
+	MCPStateNeedsAuth
 )
 
 // MarshalText implements the [encoding.TextMarshaler] interface.
@@ -33,6 +34,8 @@ func (s *MCPState) UnmarshalText(data []byte) error {
 		*s = MCPStateConnected
 	case "error":
 		*s = MCPStateError
+	case "needs auth":
+		*s = MCPStateNeedsAuth
 	default:
 		return fmt.Errorf("unknown mcp state: %s", data)
 	}
@@ -50,6 +53,8 @@ func (s MCPState) String() string {
 		return "connected"
 	case MCPStateError:
 		return "error"
+	case MCPStateNeedsAuth:
+		return "needs auth"
 	default:
 		return "unknown"
 	}
@@ -63,6 +68,7 @@ const (
 	MCPEventToolsListChanged     MCPEventType = "tools_list_changed"
 	MCPEventPromptsListChanged   MCPEventType = "prompts_list_changed"
 	MCPEventResourcesListChanged MCPEventType = "resources_list_changed"
+	MCPEventChannelMessage       MCPEventType = "channel_message"
 )
 
 // MarshalText implements the [encoding.TextMarshaler] interface.
@@ -85,6 +91,10 @@ type MCPEvent struct {
 	ToolCount     int          `json:"tool_count,omitempty"`
 	PromptCount   int          `json:"prompt_count,omitempty"`
 	ResourceCount int          `json:"resource_count,omitempty"`
+	// ChannelMessage carries the rendered <channel> element for
+	// MCPEventChannelMessage events so channel pushes reach client/server
+	// sessions over the wire.
+	ChannelMessage string `json:"channel_message,omitempty"`
 }
 
 // MarshalJSON implements the [json.Marshaler] interface.
@@ -133,6 +143,24 @@ type MCPClientInfo struct {
 	PromptCount   int       `json:"prompt_count,omitempty"`
 	ResourceCount int       `json:"resource_count,omitempty"`
 	ConnectedAt   time.Time `json:"connected_at"`
+	// Channel reports whether this server is an active channel.
+	Channel bool `json:"channel,omitempty"`
+}
+
+type MCPPromptArgument struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+type MCPPrompt struct {
+	ID          string              `json:"id"`
+	Title       string              `json:"title,omitempty"`
+	Description string              `json:"description,omitempty"`
+	PromptID    string              `json:"prompt_id"`
+	ClientID    string              `json:"client_id"`
+	Arguments   []MCPPromptArgument `json:"arguments,omitempty"`
 }
 
 // MarshalJSON implements the [json.Marshaler] interface.

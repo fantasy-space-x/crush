@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
+	"github.com/charmbracelet/crush/internal/question"
 )
 
 // NewForTest constructs a minimal [App] suitable for in-process tests
@@ -29,6 +30,7 @@ import (
 func NewForTest(ctx context.Context) *App {
 	app := &App{
 		Permissions:        permission.NewPermissionService("", false, nil),
+		Questions:          question.NewService(),
 		globalCtx:          ctx,
 		events:             pubsub.NewBroker[tea.Msg](),
 		serviceEventsWG:    &sync.WaitGroup{},
@@ -39,14 +41,18 @@ func NewForTest(ctx context.Context) *App {
 
 	eventsCtx, cancel := context.WithCancel(ctx)
 	app.eventsCtx = eventsCtx
-	setupSubscriber(eventsCtx, app.serviceEventsWG, "permissions",
-		app.Permissions.Subscribe, app.events)
-	setupSubscriber(eventsCtx, app.serviceEventsWG, "permissions-notifications",
-		app.Permissions.SubscribeNotifications, app.events)
-	setupSubscriber(eventsCtx, app.serviceEventsWG, "agent-notifications",
-		app.agentNotifications.Subscribe, app.events)
-	setupSubscriber(eventsCtx, app.serviceEventsWG, "run-completions",
-		app.runCompletions.Subscribe, app.events)
+	app.subscribeMustDeliver(eventsCtx, "permissions",
+		app.Permissions.Subscribe)
+	app.subscribeMustDeliver(eventsCtx, "permissions-notifications",
+		app.Permissions.SubscribeNotifications)
+	app.subscribeMustDeliver(eventsCtx, "question-batches",
+		app.Questions.Subscribe)
+	app.subscribeMustDeliver(eventsCtx, "question-notifications",
+		app.Questions.SubscribeNotifications)
+	app.subscribe(eventsCtx, "agent-notifications",
+		app.agentNotifications.Subscribe)
+	app.subscribe(eventsCtx, "run-completions",
+		app.runCompletions.Subscribe)
 	app.cleanupFuncs = append(app.cleanupFuncs, func(context.Context) error {
 		cancel()
 		app.serviceEventsWG.Wait()

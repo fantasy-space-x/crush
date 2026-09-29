@@ -32,7 +32,7 @@ type JobOutputResponseMetadata struct {
 	WorkingDirectory string `json:"working_directory"`
 }
 
-func NewJobOutputTool() fantasy.AgentTool {
+func NewJobOutputTool(spillDir string) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		JobOutputToolName,
 		jobOutputDescription,
@@ -73,7 +73,7 @@ func NewJobOutputTool() fantasy.AgentTool {
 			}
 
 			output := strings.Join(outputParts, "\n")
-			output = TruncateOutput(output)
+			output = TruncateOutput(output, spillDir)
 
 			metadata := JobOutputResponseMetadata{
 				ShellID:          params.ShellID,

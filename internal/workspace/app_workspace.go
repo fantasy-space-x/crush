@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
@@ -80,6 +81,10 @@ func (w *AppWorkspace) SetCurrentSession(ctx context.Context, sessionID string) 
 	return nil
 }
 
+// RoutesChannelEvents reports false: in-process mode has no server to
+// route channel events, so the frontend injects them itself.
+func (w *AppWorkspace) RoutesChannelEvents() bool { return false }
+
 // -- Messages --
 
 func (w *AppWorkspace) ListMessages(ctx context.Context, sessionID string) ([]message.Message, error) {
@@ -110,11 +115,19 @@ func (w *AppWorkspace) AgentRun(ctx context.Context, sessionID, prompt string, a
 	return err
 }
 
+func (w *AppWorkspace) AgentRunChannel(ctx context.Context, channel, sessionID, prompt string, attachments ...message.Attachment) error {
+	if w.app.AgentCoordinator == nil {
+		return errors.New("agent coordinator not initialized")
+	}
+	_, err := w.app.AgentCoordinator.Run(agent.WithChannel(ctx, channel), sessionID, prompt, attachments...)
+	return err
+}
+
 func (w *AppWorkspace) AgentRunShellCommand(ctx context.Context, sessionID, command string, termWidth int, onProgress func(string), isFirstMessage bool) (proto.ShellCommandResponse, error) {
 	var persist shell.PersistFunc
 	if sessionID != "" {
 		persist = func(cmd, output string, exitCode int) error {
-			return shell.PersistOutput(ctx, w.app.Messages, sessionID, cmd, output, exitCode)
+			return shell.PersistOutput(ctx, w.app.Messages, sessionID, cmd, output, exitCode, w.store.Config().Options.DataDirectory)
 		}
 	}
 
@@ -191,6 +204,13 @@ func (w *AppWorkspace) AgentIsReady() bool {
 	return w.app.AgentCoordinator != nil
 }
 
+func (w *AppWorkspace) AgentReadyErr() error {
+	if w.app.AgentCoordinator == nil {
+		return ErrAgentNotInitialized
+	}
+	return nil
+}
+
 func (w *AppWorkspace) AgentQueuedPrompts(sessionID string) int {
 	if w.app.AgentCoordinator == nil {
 		return 0
@@ -211,6 +231,13 @@ func (w *AppWorkspace) AgentClearQueue(sessionID string) {
 	}
 }
 
+func (w *AppWorkspace) AgentSetMain(agentID string) error {
+	if w.app.AgentCoordinator == nil {
+		return errors.New("agent coordinator not initialized")
+	}
+	return w.app.AgentCoordinator.SetMainAgent(agentID)
+}
+
 func (w *AppWorkspace) AgentSummarize(ctx context.Context, sessionID string) error {
 	if w.app.AgentCoordinator == nil {
 		return errors.New("agent coordinator not initialized")
@@ -224,6 +251,10 @@ func (w *AppWorkspace) UpdateAgentModel(ctx context.Context) error {
 
 func (w *AppWorkspace) InitCoderAgent(ctx context.Context) error {
 	return w.app.InitCoderAgent(ctx)
+}
+
+func (w *AppWorkspace) InitCoderAgentNonInteractive(ctx context.Context) error {
+	return w.app.InitCoderAgentNonInteractive(ctx)
 }
 
 func (w *AppWorkspace) GetDefaultSmallModel(providerID string) config.SelectedModel {
@@ -250,6 +281,16 @@ func (w *AppWorkspace) PermissionSkipRequests() bool {
 
 func (w *AppWorkspace) PermissionSetSkipRequests(skip bool) {
 	w.app.Permissions.SetSkipRequests(skip)
+}
+
+// -- Questions --
+
+func (w *AppWorkspace) QuestionAnswer(responses []question.Answer) bool {
+	return w.app.Questions.Answer(responses)
+}
+
+func (w *AppWorkspace) QuestionCancel() bool {
+	return w.app.Questions.Cancel()
 }
 
 // -- FileTracker --
@@ -330,11 +371,19 @@ func (w *AppWorkspace) SetCompactMode(scope config.Scope, enabled bool) error {
 }
 
 func (w *AppWorkspace) SetProviderAPIKey(scope config.Scope, providerID string, apiKey any) error {
-	return w.store.SetProviderAPIKey(scope, providerID, apiKey)
+	if err := w.store.SetProviderAPIKey(scope, providerID, apiKey); err != nil {
+		return err
+	}
+	w.store.SignalAuthComplete(providerID)
+	return nil
 }
 
 func (w *AppWorkspace) SetConfigField(scope config.Scope, key string, value any) error {
 	return w.store.SetConfigField(scope, key, value)
+}
+
+func (w *AppWorkspace) SetConfigFields(scope config.Scope, fields map[string]any) error {
+	return w.store.SetConfigFields(scope, fields)
 }
 
 func (w *AppWorkspace) RemoveConfigField(scope config.Scope, key string) error {
@@ -408,6 +457,10 @@ func (w *AppWorkspace) ReadMCPResource(ctx context.Context, name, uri string) ([
 	return result, nil
 }
 
+func (w *AppWorkspace) ListMCPPrompts(context.Context) ([]commands.MCPPrompt, error) {
+	return commands.LoadMCPPrompts()
+}
+
 func (w *AppWorkspace) GetMCPPrompt(clientID, promptID string, args map[string]string) (string, error) {
 	return commands.GetMCPPrompt(w.store, clientID, promptID, args)
 }
@@ -438,6 +491,52 @@ func (w *AppWorkspace) DisableDockerMCP() error {
 		return fmt.Errorf("failed to disable docker MCP: %w", err)
 	}
 	return w.store.DisableDockerMCP()
+}
+
+// MCPServersDisabled returns the MCP servers disabled for this
+// repository. The override set is shared by every session, including
+// sub-agent sessions.
+func (w *AppWorkspace) MCPServersDisabled(ctx context.Context) ([]string, error) {
+	return w.app.Sessions.MCPDisabledServers(ctx)
+}
+
+// MCPServersEnabled returns the MCP servers with a repository-scoped
+// enabled override: config-disabled servers the user enabled here. Startup
+// force-starts them so the toggle survives restarts.
+func (w *AppWorkspace) MCPServersEnabled(ctx context.Context) ([]string, error) {
+	return w.app.Sessions.MCPServersEnabled(ctx)
+}
+
+// MCPSetServerDisabled adds or removes a repository-scoped MCP override.
+// Config files are never touched.
+func (w *AppWorkspace) MCPSetServerDisabled(ctx context.Context, name string, disabled bool) error {
+	return w.app.Sessions.SetMCPServerDisabled(ctx, name, disabled)
+}
+
+// MCPSetServerConfigDisabled toggles an MCP server's disabled flag in the
+// global config and applies the change to the running client.
+func (w *AppWorkspace) MCPSetServerConfigDisabled(ctx context.Context, name string, disabled bool) error {
+	return mcptools.SetConfigDisabled(ctx, w.store, config.ScopeGlobal, name, disabled)
+}
+
+// MCPStartServer starts the named MCP server even when its config entry is
+// disabled. The repository-scoped enabled override recorded by
+// MCPSetServerDisabled makes the start survive restarts. Config files are
+// never touched.
+func (w *AppWorkspace) MCPStartServer(ctx context.Context, name string) error {
+	return mcptools.InitializeSingleForced(ctx, name, w.store)
+}
+
+func (w *AppWorkspace) MCPAuthenticate(ctx context.Context, name string) error {
+	return mcptools.AuthenticateMCP(ctx, w.store, name)
+}
+
+func (w *AppWorkspace) MCPPendingAuth() []mcptools.PendingAuthServer {
+	return mcptools.PendingAuthMCPs(w.store)
+}
+
+func (w *AppWorkspace) MCPAuthURL(name string) string {
+	return mcptools.MCPAuthURL(name)
 }
 
 // -- Lifecycle --

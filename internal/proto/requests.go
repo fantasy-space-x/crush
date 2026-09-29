@@ -102,6 +102,17 @@ type ProjectInitPromptResponse struct {
 	Prompt string `json:"prompt"`
 }
 
+// AgentInitRequest represents a request to initialize the agent.
+type AgentInitRequest struct {
+	Interactive bool `json:"interactive"`
+}
+
+// AgentSetMainRequest requests switching the workspace's active agent
+// (e.g. "coder" or "plan").
+type AgentSetMainRequest struct {
+	AgentID string `json:"agent_id"`
+}
+
 // LSPStartRequest represents a request to start an LSP for a path.
 type LSPStartRequest struct {
 	Path string `json:"path"`
@@ -116,6 +127,27 @@ type FileTrackerReadRequest struct {
 // MCPNameRequest represents a request targeting a named MCP server.
 type MCPNameRequest struct {
 	Name string `json:"name"`
+}
+
+// MCPSetServerDisabledRequest toggles a repository-scoped MCP server
+// override for the workspace's Toggle MCPs dialog.
+type MCPSetServerDisabledRequest struct {
+	Name     string `json:"name"`
+	Disabled bool   `json:"disabled"`
+}
+
+// MCPPendingAuthServer describes an MCP server awaiting OAuth
+// authentication, returned to clients so they can prompt the user.
+type MCPPendingAuthServer struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// MCPAuthResponse describes the result of an MCP authentication request.
+type MCPAuthResponse struct {
+	// AuthURL is the OAuth authorization URL the user must visit, when
+	// the flow is still in progress.
+	AuthURL string `json:"auth_url,omitempty"`
 }
 
 // MCPReadResourceRequest represents a request to read an MCP resource.

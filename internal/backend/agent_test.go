@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +26,10 @@ type blockingCoordinator struct {
 	release  chan struct{}
 	runCount atomic.Int32
 	cancelID atomic.Value
+
+	setMainAgentErr  error
+	lastMainAgentSet atomic.Value
+	busy             bool
 }
 
 func newBlockingCoordinator() *blockingCoordinator {
@@ -51,7 +56,7 @@ func (c *blockingCoordinator) RunAccepted(ctx context.Context, accept *agent.Acc
 func (c *blockingCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun { return nil }
 func (c *blockingCoordinator) Cancel(sessionID string)                           { c.cancelID.Store(sessionID) }
 func (c *blockingCoordinator) CancelAll()                                        {}
-func (c *blockingCoordinator) IsBusy() bool                                      { return false }
+func (c *blockingCoordinator) IsBusy() bool                                      { return c.busy }
 func (c *blockingCoordinator) IsSessionBusy(string) bool                         { return false }
 func (c *blockingCoordinator) QueuedPrompts(string) int                          { return 0 }
 func (c *blockingCoordinator) QueuedPromptsList(string) []string                 { return nil }
@@ -60,6 +65,10 @@ func (c *blockingCoordinator) Summarize(context.Context, string) error          
 func (c *blockingCoordinator) Model() agent.Model                                { return agent.Model{} }
 func (c *blockingCoordinator) UpdateModels(context.Context) error                { return nil }
 func (c *blockingCoordinator) GenerateTitle(context.Context, string, string)     {}
+func (c *blockingCoordinator) SetMainAgent(agentName string) error {
+	c.lastMainAgentSet.Store(agentName)
+	return c.setMainAgentErr
+}
 
 // insertAgentWorkspace installs a synthetic workspace with the given
 // coordinator (or none) and a workspace run context, mirroring the
@@ -199,73 +208,52 @@ func TestCancelSession_KillsBackgroundShells(t *testing.T) {
 	require.True(t, ok)
 }
 
-func TestDetachClient_KillsCurrentSessionBackgroundShells(t *testing.T) {
-	manager := shell.GetBackgroundShellManager()
-	manager.KillAll(t.Context())
-	t.Cleanup(func() {
-		manager.KillAll(t.Context())
-	})
-
+func TestSetMainAgent_WorkspaceNotFound(t *testing.T) {
+	t.Parallel()
 	b, _ := newTestBackend(t)
-	coord := newBlockingCoordinator()
-	ws := insertAgentWorkspace(t, b, coord)
-
-	cid := newClientID(t)
-	require.NoError(t, b.AttachClient(ws.ID, cid))
-	require.NoError(t, b.SetCurrentSession(ws.ID, cid, "S2"))
-
-	workingDir := t.TempDir()
-	shellA, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
-	require.NoError(t, err)
-	other, err := manager.StartForSession(t.Context(), "S3", workingDir, nil, "while true; do :; done", "")
-	require.NoError(t, err)
-
-	b.DetachClient(ws.ID, cid)
-
-	require.Equal(t, "S2", coord.cancelID.Load())
-	require.True(t, shellA.IsDone())
-	require.False(t, other.IsDone())
-
-	_, ok := manager.Get(shellA.ID)
-	require.False(t, ok)
-	_, ok = manager.Get(other.ID)
-	require.True(t, ok)
+	err := b.SetMainAgent("nope", "plan")
+	require.ErrorIs(t, err, ErrWorkspaceNotFound)
 }
 
-func TestDetachClient_KeepsCurrentSessionWhenAnotherClientIsAttached(t *testing.T) {
-	manager := shell.GetBackgroundShellManager()
-	manager.KillAll(t.Context())
-	t.Cleanup(func() {
-		manager.KillAll(t.Context())
-	})
+func TestSetMainAgent_AgentNotInitialized(t *testing.T) {
+	t.Parallel()
+	b, _ := newTestBackend(t)
+	ws := insertAgentWorkspace(t, b, nil)
+	err := b.SetMainAgent(ws.ID, "plan")
+	require.ErrorIs(t, err, ErrAgentNotInitialized)
+}
 
+func TestSetMainAgent_Success(t *testing.T) {
+	t.Parallel()
 	b, _ := newTestBackend(t)
 	coord := newBlockingCoordinator()
 	ws := insertAgentWorkspace(t, b, coord)
 
-	cidA := newClientID(t)
-	require.NoError(t, b.AttachClient(ws.ID, cidA))
-	require.NoError(t, b.SetCurrentSession(ws.ID, cidA, "S2"))
-
-	cidB := newClientID(t)
-	require.NoError(t, b.AttachClient(ws.ID, cidB))
-	require.NoError(t, b.SetCurrentSession(ws.ID, cidB, "S2"))
-
-	workingDir := t.TempDir()
-	bgShell, err := manager.StartForSession(t.Context(), "S2", workingDir, nil, "while true; do :; done", "")
+	err := b.SetMainAgent(ws.ID, "plan")
 	require.NoError(t, err)
+	require.Equal(t, "plan", coord.lastMainAgentSet.Load())
+}
 
-	b.DetachClient(ws.ID, cidA)
+func TestSetMainAgent_RejectedWhileBusy(t *testing.T) {
+	t.Parallel()
+	b, _ := newTestBackend(t)
+	coord := newBlockingCoordinator()
+	coord.busy = true
+	ws := insertAgentWorkspace(t, b, coord)
 
-	require.Nil(t, coord.cancelID.Load())
-	require.False(t, bgShell.IsDone())
-	_, ok := manager.Get(bgShell.ID)
-	require.True(t, ok)
+	err := b.SetMainAgent(ws.ID, "plan")
+	require.ErrorIs(t, err, ErrAgentBusy)
+	require.Nil(t, coord.lastMainAgentSet.Load(), "busy agent must not be switched")
+}
 
-	b.DetachClient(ws.ID, cidB)
+func TestSetMainAgent_PropagatesCoordinatorError(t *testing.T) {
+	t.Parallel()
+	b, _ := newTestBackend(t)
+	coord := newBlockingCoordinator()
+	wantErr := errors.New("main agent not found: 123")
+	coord.setMainAgentErr = wantErr
+	ws := insertAgentWorkspace(t, b, coord)
 
-	require.Equal(t, "S2", coord.cancelID.Load())
-	require.True(t, bgShell.IsDone())
-	_, ok = manager.Get(bgShell.ID)
-	require.False(t, ok)
+	err := b.SetMainAgent(ws.ID, "123")
+	require.ErrorIs(t, err, wantErr)
 }

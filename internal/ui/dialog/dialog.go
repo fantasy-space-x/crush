@@ -49,12 +49,18 @@ type LoadingDialog interface {
 	StopLoading()
 }
 
+// HoverDialog is a dialog that reacts to mouse hover. While one is open,
+// the terminal must report all mouse motion events, not just clicks.
+type HoverDialog interface {
+	HandlesHover() bool
+}
+
 // Grace period constants for dialogs that open asynchronously and may
 // receive in-flight keystrokes from a previously focused component.
 const (
 	// graceQuietPeriod is how long input must be quiet before the dialog
 	// arms. Each absorbed keystroke resets this timer.
-	graceQuietPeriod = 200 * time.Millisecond
+	graceQuietPeriod = 425 * time.Millisecond
 	// graceMaxDelay is the absolute ceiling: the dialog always arms after
 	// this duration regardless of input activity. Prevents auto-repeat
 	// from keeping the dialog disarmed indefinitely.
@@ -88,6 +94,17 @@ func NewOverlay(dialogs ...Dialog) *Overlay {
 // HasDialogs checks if there are any active dialogs.
 func (d *Overlay) HasDialogs() bool {
 	return len(d.dialogs) > 0
+}
+
+// HandlesHover reports whether any open dialog reacts to mouse hover, in
+// which case the terminal should report all mouse motion events.
+func (d *Overlay) HandlesHover() bool {
+	for _, dialog := range d.dialogs {
+		if hd, ok := dialog.(HoverDialog); ok && hd.HandlesHover() {
+			return true
+		}
+	}
+	return false
 }
 
 // ContainsDialog checks if a dialog with the specified ID exists.
@@ -253,9 +270,13 @@ func (d *Overlay) StopLoading() {
 }
 
 // DrawCenterCursor draws the given string view centered in the screen area and
-// adjusts the cursor position accordingly.
+// adjusts the cursor position accordingly. Content larger than the area is
+// clamped to fit.
 func DrawCenterCursor(scr uv.Screen, area uv.Rectangle, view string, cur *tea.Cursor) {
 	width, height := lipgloss.Size(view)
+	// Clamp to available area so oversized dialogs don't draw outside bounds.
+	width = min(width, area.Dx())
+	height = min(height, area.Dy())
 	center := common.CenterRect(area, width, height)
 	if cur != nil {
 		cur.X += center.Min.X
@@ -275,9 +296,12 @@ func DrawOnboarding(scr uv.Screen, area uv.Rectangle, view string) {
 }
 
 // DrawOnboardingCursor draws the given string view positioned at the bottom
-// left area of the screen.
+// left area of the screen. Content larger than the area is clamped to fit.
 func DrawOnboardingCursor(scr uv.Screen, area uv.Rectangle, view string, cur *tea.Cursor) {
 	width, height := lipgloss.Size(view)
+	// Clamp to available area so oversized dialogs don't draw outside bounds.
+	width = min(width, area.Dx())
+	height = min(height, area.Dy())
 	bottomLeft := common.BottomLeftRect(area, width, height)
 	if cur != nil {
 		cur.X += bottomLeft.Min.X

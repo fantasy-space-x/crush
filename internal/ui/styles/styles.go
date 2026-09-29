@@ -2,8 +2,10 @@
 package styles
 
 import (
+	"encoding/json"
 	"fmt"
 	"image/color"
+	"log/slog"
 	"strings"
 
 	"charm.land/bubbles/v2/filepicker"
@@ -14,6 +16,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/alecthomas/chroma/v2"
 	"github.com/charmbracelet/crush/internal/ui/diffview"
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
 const (
@@ -24,6 +27,26 @@ const (
 	HypercreditIcon string = "◆"
 
 	ArrowRightIcon string = "→"
+
+	// CodespanPadding is the padding rendered around inline code spans in
+	// markdown. It displays identically to the blank padding it replaced,
+	// but selection copies recognize it and turn it back into the original
+	// backticks (see list.HighlightContent).
+	//
+	// It is a no-break space tagged with the text-presentation variation
+	// selector (U+FE0E): the pair is a single one-cell grapheme that
+	// renders as a blank and, being non-breaking, keeps word wrap from
+	// tearing a codespan between its padding and its text. The selector
+	// makes the sentinel distinct from a real no-break space in message
+	// text (pasted text, some LLM output), which a selection copy must
+	// preserve verbatim.
+	//
+	// The selector must be U+FE0E, not the emoji-presentation U+FE0F:
+	// ansi.StringWidth measures any cluster ending in U+FE0F as two
+	// cells wide, while terminals render it as one, and that mismatch
+	// makes the frame differ repaint the line on every frame (visible
+	// as flicker).
+	CodespanPadding string = "\u00a0\ufe0e"
 
 	ToolPending string = "●"
 	ToolSuccess string = "✓"
@@ -41,9 +64,12 @@ const (
 	TodoPendingIcon    string = "•"
 	TodoInProgressIcon string = "→"
 
-	ImageIcon string = "■"
-	TextIcon  string = "≡"
-	SkillIcon string = "▲"
+	ImageIcon  string = "■"
+	TextIcon   string = "≡"
+	SkillIcon  string = "▲"
+	RemoveIcon string = "✕"
+
+	ColorSwatchIcon string = "■"
 
 	ScrollbarThumb string = "┃"
 	ScrollbarTrack string = "│"
@@ -101,6 +127,7 @@ type Styles struct {
 	// Markdown & Chroma
 	Markdown      ansi.StyleConfig
 	QuietMarkdown ansi.StyleConfig
+	PlanMarkdown  ansi.StyleConfig
 
 	// Inputs
 	TextInput textinput.Styles
@@ -118,17 +145,31 @@ type Styles struct {
 	Button struct {
 		Focused lipgloss.Style
 		Blurred lipgloss.Style
+		// Inactive styles buttons of a prompt that is not in the
+		// active pane: slightly lighter than Blurred so the choices
+		// stay legible while the chat has focus.
+		Inactive lipgloss.Style
+		Hovered  lipgloss.Style
+		Negative lipgloss.Style // Selected negative/destructive action.
 	}
 
 	// Editor
 	Editor struct {
 		Textarea textarea.Styles
 
-		// Normal mode prompt (default "::: ").
-		PromptNormalFocused lipgloss.Style
-		PromptNormalBlurred lipgloss.Style
+		// Normal mode prompt ("> " icon on the first line, "::: " after).
+		PromptNormalIconFocused lipgloss.Style
+		PromptNormalIconBlurred lipgloss.Style
+		PromptNormalFocused     lipgloss.Style
+		PromptNormalBlurred     lipgloss.Style
 
-		// YOLO mode prompt (" ! " icon + ":::" dots).
+		// Plan mode prompt.
+		PromptPlanIconFocused lipgloss.Style
+		PromptPlanIconBlurred lipgloss.Style
+		PromptPlanDotsFocused lipgloss.Style
+		PromptPlanDotsBlurred lipgloss.Style
+
+		// YOLO mode prompt.
 		PromptYoloIconFocused lipgloss.Style
 		PromptYoloIconBlurred lipgloss.Style
 		PromptYoloDotsFocused lipgloss.Style
@@ -139,6 +180,22 @@ type Styles struct {
 		PromptBangIconBlurred lipgloss.Style
 		PromptBangDotsFocused lipgloss.Style
 		PromptBangDotsBlurred lipgloss.Style
+
+		// Question mode prompt (" ? " icon + ":::" dots).
+		PromptQuestionIconFocused lipgloss.Style
+		PromptQuestionIconBlurred lipgloss.Style
+
+		// Question choice styling.
+		QuestionSelected   lipgloss.Style // Active choice text (Dolly).
+		QuestionUnselected lipgloss.Style // Inactive header text (Sash).
+		QuestionBody       lipgloss.Style // Description/body text.
+		QuestionConfirm    lipgloss.Style // Confirm tab title (primary).
+		QuestionNote       lipgloss.Style // Saved note text (dimmer than body).
+		QuestionCursorBar  lipgloss.Style // Active cursor indicator bar.
+		QuestionRadioOn    lipgloss.Style // Selected single-choice radio.
+		QuestionRadioOff   lipgloss.Style // Unselected single-choice radio.
+		QuestionCheckOn    lipgloss.Style // Checked multi-choice indicator.
+		QuestionCheckOff   lipgloss.Style // Unchecked multi-choice indicator.
 	}
 
 	// Radio
@@ -146,6 +203,17 @@ type Styles struct {
 		On    lipgloss.Style
 		Off   lipgloss.Style
 		Label lipgloss.Style // Text next to a radio button
+	}
+
+	// Tabs for batch question forms. Uses uv types for direct
+	// screen rendering without lipgloss.
+	Tab struct {
+		ActiveBorder          uv.Border
+		InactiveBorder        uv.Border
+		ActiveBorderBlurred   uv.Border
+		InactiveBorderBlurred uv.Border
+		ActiveStyle           uv.Style
+		InactiveStyle         uv.Style
 	}
 
 	// Background
@@ -170,6 +238,7 @@ type Styles struct {
 	WorkingGradFromColor color.Color
 	WorkingGradToColor   color.Color
 	WorkingLabelColor    color.Color // Label text color next to the indicator
+	WorkingTimerColor    color.Color // Elapsed timer suffix color
 
 	// Section Title
 	Section struct {
@@ -224,6 +293,8 @@ type Styles struct {
 		BusyIcon        lipgloss.Style // Busy/starting status icon
 		ErrorIcon       lipgloss.Style // Error status icon
 		OnlineIcon      lipgloss.Style // Online/ready status icon
+		OnlineText      lipgloss.Style // Online/ready status text (e.g. "connected"), no icon
+		NeedsAuthIcon   lipgloss.Style // Needs authentication status icon
 		AdditionalText  lipgloss.Style // "None" and "…and N more" text
 		CapabilityCount lipgloss.Style // "N tools" / "N prompts" / "N resources"
 		RowTitleBase    lipgloss.Style // Base style applied over row titles in common.Status
@@ -269,6 +340,9 @@ type Styles struct {
 		ShellTruncation    lipgloss.Style // "N more lines" hint.
 		SectionHeader      lipgloss.Style
 
+		// Plan section styles
+		PlanBox lipgloss.Style // Border+padding for the final plan message
+
 		// Thinking section styles
 		ThinkingBox            lipgloss.Style // Background for thinking content
 		ThinkingTruncationHint lipgloss.Style // "… (N lines hidden)" hint
@@ -278,6 +352,7 @@ type Styles struct {
 		AssistantInfoModel     lipgloss.Style
 		AssistantInfoProvider  lipgloss.Style
 		AssistantInfoDuration  lipgloss.Style
+		SubduedHypercreditIcon lipgloss.Style // Subdued ◆ for hypercredit figures within subdued text
 		AssistantCanceled      lipgloss.Style // Italic "Canceled" footer
 	}
 
@@ -423,7 +498,8 @@ type Styles struct {
 		Spinner lipgloss.Style
 
 		// ContentPanel is used for content blocks with subtle background.
-		ContentPanel lipgloss.Style
+		ContentPanel   lipgloss.Style
+		ContentPanelBg color.Color // Background color for ContentPanel syntax highlighting.
 
 		// Scrollbar styles for scrollable content.
 		ScrollbarThumb lipgloss.Style
@@ -458,11 +534,19 @@ type Styles struct {
 
 		Quit struct {
 			Content lipgloss.Style // Wrapper for the quit dialog's inner content
+			Hint    lipgloss.Style // Style for quit hint
 			Frame   lipgloss.Style // Outer rounded border framing the quit dialog
 		}
 
 		APIKey struct {
 			Spinner lipgloss.Style // Loading spinner while validating the key
+		}
+
+		// AuthMethod styles the OAuth-vs-API-key choice dialog.
+		AuthMethod struct {
+			Prompt      lipgloss.Style // "How would you like to authenticate?" question line
+			CardBlurred lipgloss.Style // Unselected choice card frame and label
+			CardFocused lipgloss.Style // Selected choice card frame and label
 		}
 
 		OAuth struct {
@@ -508,6 +592,16 @@ type Styles struct {
 	Status struct {
 		Help lipgloss.Style
 
+		// Mode badges shown before the help hints.
+		ModeBadgePlan lipgloss.Style
+		ModeBadgeYolo lipgloss.Style
+
+		// Full-width banners shown when switching modes.
+		ModeBannerPlan      lipgloss.Style
+		ModeBannerPlanBadge lipgloss.Style
+		ModeBannerYolo      lipgloss.Style
+		ModeBannerYoloBadge lipgloss.Style
+
 		ErrorIndicator   lipgloss.Style
 		WarnIndicator    lipgloss.Style
 		InfoIndicator    lipgloss.Style
@@ -534,14 +628,14 @@ type Styles struct {
 		Image    lipgloss.Style
 		Text     lipgloss.Style
 		Skill    lipgloss.Style
+		Remove   lipgloss.Style
 		Deleting lipgloss.Style
 	}
 
 	// Pills styles for todo/queue pills
 	Pills struct {
 		Base               lipgloss.Style // Base pill style with padding
-		Focused            lipgloss.Style // Focused pill with visible border
-		Blurred            lipgloss.Style // Blurred pill with hidden border
+		Focused            lipgloss.Style // Pill with visible rounded border
 		QueueItemPrefix    lipgloss.Style // Prefix for queue list items
 		QueueItemText      lipgloss.Style // Queue list item body text
 		QueueLabel         lipgloss.Style // "N Queued" label text
@@ -601,6 +695,35 @@ func (s *Styles) ChromaTheme() chroma.StyleEntries {
 // DialogHelpStyles returns the styles for dialog help.
 func (s *Styles) DialogHelpStyles() help.Styles {
 	return help.Styles(s.Dialog.Help)
+}
+
+// Clone returns a deep copy of the Styles struct, ensuring pointer fields
+// (particularly within ansi.StyleConfig) are not aliased. This is used to
+// safely snapshot styles before a theme preview.
+func (s *Styles) Clone() Styles {
+	clone := *s
+	clone.Markdown = cloneStyleConfig(s.Markdown)
+	clone.QuietMarkdown = cloneStyleConfig(s.QuietMarkdown)
+	return clone
+}
+
+// cloneStyleConfig deep-copies an ansi.StyleConfig by JSON round-tripping.
+//
+// NOTE: This assumes ansi.StyleConfig remains fully JSON-round-trippable.
+// If the glamour library adds non-serializable fields, this approach will
+// need to be replaced with a reflect-based deep copy.
+func cloneStyleConfig(src ansi.StyleConfig) ansi.StyleConfig {
+	data, err := json.Marshal(src)
+	if err != nil {
+		slog.Error("Failed to marshal markdown styles for theme preview", "error", err)
+		return src
+	}
+	var dst ansi.StyleConfig
+	if err := json.Unmarshal(data, &dst); err != nil {
+		slog.Error("Failed to unmarshal markdown styles for theme preview", "error", err)
+		return src
+	}
+	return dst
 }
 
 // hex returns a pointer to the "#rrggbb" representation of c. It's used to

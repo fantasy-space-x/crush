@@ -38,6 +38,11 @@ const (
 	FinishReasonToolUse   FinishReason = "tool_use"
 	FinishReasonCanceled  FinishReason = "canceled"
 	FinishReasonError     FinishReason = "error"
+	// FinishReasonContentFilter is a provider safety/refusal stop
+	// (Anthropic stop_reason=refusal, OpenAI content_filter, etc.).
+	// The TUI renders this as a REFUSED banner rather than a silent
+	// empty turn.
+	FinishReasonContentFilter FinishReason = "content_filter"
 
 	// Should never happen
 	FinishReasonUnknown FinishReason = "unknown"
@@ -64,6 +69,8 @@ func (ReasoningContent) isPart() {}
 
 type TextContent struct {
 	Text string `json:"text"`
+	// Hidden marks generated user continuations that remain in model history.
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 func (tc TextContent) String() string {
@@ -171,6 +178,17 @@ type Message struct {
 	CreatedAt        int64
 	UpdatedAt        int64
 	IsSummaryMessage bool
+	// PrismModelID and PrismModelName identify the model that actually
+	// served the turn, as reported by the Hyper Prism model router
+	// headers. Empty when the turn was not routed through Prism.
+	PrismModelID   string
+	PrismModelName string
+	// PrismHypercreditSavings and PrismDollarSavings are the savings
+	// from routing through Prism, as reported by its savings trailers.
+	// Nil when not reported. When both are present the hypercredit
+	// figure is the one shown.
+	PrismHypercreditSavings *float64
+	PrismDollarSavings      *float64
 }
 
 func (m *Message) Content() TextContent {
@@ -258,6 +276,17 @@ func (m *Message) FinishReason() FinishReason {
 	return ""
 }
 
+// IsErrorLike reports whether the message finished with an error-style
+// banner (a real error or a provider safety refusal). The TUI renders
+// both through the same banner path.
+func (m *Message) IsErrorLike() bool {
+	switch m.FinishReason() {
+	case FinishReasonError, FinishReasonContentFilter:
+		return true
+	}
+	return false
+}
+
 func (m *Message) IsThinking() bool {
 	if m.ReasoningContent().Thinking != "" && m.Content().Text == "" && !m.IsFinished() {
 		return true
@@ -269,7 +298,7 @@ func (m *Message) AppendContent(delta string) {
 	found := false
 	for i, part := range m.Parts {
 		if c, ok := part.(TextContent); ok {
-			m.Parts[i] = TextContent{Text: c.Text + delta}
+			m.Parts[i] = TextContent{Text: c.Text + delta, Hidden: c.Hidden}
 			found = true
 		}
 	}
@@ -451,6 +480,23 @@ func (m *Message) Clone() Message {
 	clone.Parts = make([]ContentPart, len(m.Parts))
 	copy(clone.Parts, m.Parts)
 	return clone
+}
+
+// ResetStreamedContent removes all parts that were added during streaming
+// (text, reasoning, tool calls, finish) so the message is ready for a
+// retry. Non-streamed parts (images, binary attachments, tool results,
+// shell commands) are preserved.
+func (m *Message) ResetStreamedContent() {
+	kept := m.Parts[:0]
+	for _, part := range m.Parts {
+		switch part.(type) {
+		case TextContent, ReasoningContent, ToolCall, Finish:
+			// Drop streamed parts.
+		default:
+			kept = append(kept, part)
+		}
+	}
+	m.Parts = kept
 }
 
 func (m *Message) AddFinish(reason FinishReason, message, details string) {

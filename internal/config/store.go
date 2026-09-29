@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
+	"github.com/charmbracelet/crush/internal/oauth/openai"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"golang.org/x/sync/singleflight"
@@ -37,6 +39,13 @@ const configLockDeadline = 5 * time.Second
 // revoking the whole token family.
 const refreshLockDeadline = 45 * time.Second
 
+// credentialWriteLockDeadline bounds how long a credential write (e.g.
+// storing the token from a fresh interactive login) waits for the
+// per-provider refresh lock. It is deliberately shorter than
+// refreshLockDeadline because a user is watching: if a peer is wedged we
+// would rather write and risk a rare clobber than hang the UI.
+const credentialWriteLockDeadline = 10 * time.Second
+
 // fileSnapshot captures metadata about a config file at a point in time.
 type fileSnapshot struct {
 	Path    string
@@ -52,6 +61,16 @@ type RuntimeOverrides struct {
 	SkipPermissionRequests bool
 	DataDirectory          string
 	Model                  RuntimeModelOverride
+	// EnabledChannels lists the MCP servers opted in as channels for this
+	// session (via the --channels flag). A server present in MCP config only
+	// pushes channel events when it also appears here. Entries may be written
+	// as "server:<name>" or as a bare "<name>".
+	EnabledChannels []string
+	// Models records the model choices made in this instance, whether
+	// persisted or not. They are reapplied after a config reload so that a
+	// selection made here always outranks whatever the shared config file
+	// happens to hold — see pinPreferredModelLocked.
+	Models map[SelectedModelType]SelectedModel
 }
 
 // ConfigStore is the single entry point for all config access. It owns the
@@ -90,8 +109,8 @@ type ConfigStore struct {
 	// build a fresh Config rather than mutating the live one.
 	configMu sync.RWMutex
 
-	mu      sync.Mutex // serialises config file writes
-	writeMu sync.Mutex // serialises in-memory config production (mutators + reload)
+	mu      sync.Mutex   // serialises config file writes
+	writeMu sync.RWMutex // serialises in-memory config production (mutators + reload); RLock for readers
 
 	// refreshSF collapses concurrent in-process OAuth refreshes for the
 	// same provider into a single attempt. Combined with the per-provider
@@ -104,6 +123,13 @@ type ConfigStore struct {
 	// real network calls. Production code leaves it nil, and exchange falls
 	// back to the real provider clients.
 	exchangeToken func(ctx context.Context, providerID, refreshToken string) (*oauth.Token, error)
+
+	// authSignalMu guards authSignals, which maps provider IDs to
+	// channels that WaitForTokenChange blocks on. SignalAuthComplete
+	// closes the channel to unblock waiters; a new channel is created
+	// on the next wait.
+	authSignalMu sync.Mutex
+	authSignals  map[string]chan struct{}
 }
 
 // Config returns the pure-data config struct (read-only after load).
@@ -135,20 +161,87 @@ func (s *ConfigStore) WorkingDir() string {
 
 // Resolver returns the variable resolver.
 func (s *ConfigStore) Resolver() VariableResolver {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	return s.resolver
 }
 
 // Resolve resolves a variable reference using the configured resolver.
 func (s *ConfigStore) Resolve(key string) (string, error) {
-	if s.resolver == nil {
+	s.writeMu.RLock()
+	r := s.resolver
+	s.writeMu.RUnlock()
+	if r == nil {
 		return "", fmt.Errorf("no variable resolver configured")
 	}
-	return s.resolver.ResolveValue(key)
+	return r.ResolveValue(key)
 }
 
 // KnownProviders returns the list of known providers.
 func (s *ConfigStore) KnownProviders() []catwalk.Provider {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	return s.knownProviders
+}
+
+// RefetchHyperProvider re-fetches the Hyper provider catalog from the
+// remote API and updates the in-memory known providers list and config.
+// This is called after OAuth authentication completes so the latest
+// models are available without restarting.
+func (s *ConfigStore) RefetchHyperProvider(ctx context.Context) error {
+	// Build a fresh client that reads the API key from the live config,
+	// not the stale snapshot captured at startup. The syncer's original
+	// client closes over the startup config and would send an expired
+	// token after OAuth re-authentication.
+	freshClient := realHyperClient{
+		baseURL:    hyperp.BaseURL(),
+		resolveKey: func() string { return ResolveHyperAPIKey(s.Config()) },
+	}
+	hyperSyncer.SetClient(freshClient)
+
+	hyperProvider, err := hyperSyncer.Refetch(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to refetch Hyper provider: %w", err)
+	}
+	if hyperProvider.ID == "" {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Replace or insert the Hyper entry in knownProviders.
+	found := false
+	for i, p := range s.knownProviders {
+		if string(p.ID) == string(hyperProvider.ID) {
+			s.knownProviders[i] = hyperProvider
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.knownProviders = append([]catwalk.Provider{hyperProvider}, s.knownProviders...)
+	}
+
+	// Update the Hyper provider config with the refreshed model list
+	// and endpoint. Use cloneForWrite so readers always see a consistent
+	// snapshot (the store's contract forbids in-place config mutation).
+	nc := s.config.cloneForWrite()
+	if pc, ok := nc.Providers.Get(string(hyperProvider.ID)); ok {
+		pc.Models = hyperProvider.Models
+		if hyperProvider.APIEndpoint != "" {
+			pc.BaseURL = hyperProvider.APIEndpoint
+		}
+		nc.Providers.Set(string(hyperProvider.ID), pc)
+	}
+	s.setConfig(nc)
+
+	// Also update the memoized provider list so callers of
+	// config.Providers() (e.g. the models dialog) see fresh data.
+	UpdateProviderInList(hyperProvider)
+
+	s.SetupAgents()
+	return nil
 }
 
 // SetupAgents configures the coder and task agents on the config.
@@ -158,11 +251,15 @@ func (s *ConfigStore) SetupAgents() {
 
 // Overrides returns the runtime overrides for this store.
 func (s *ConfigStore) Overrides() *RuntimeOverrides {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	return &s.overrides
 }
 
 // LoadedPaths returns the config file paths that were successfully loaded.
 func (s *ConfigStore) LoadedPaths() []string {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	return slices.Clone(s.loadedPaths)
 }
 
@@ -370,7 +467,23 @@ func (s *ConfigStore) OverridePreferredModel(modelType SelectedModelType, model 
 			c.Models = make(map[SelectedModelType]SelectedModel)
 		}
 		c.Models[modelType] = model
+		s.pinPreferredModelLocked(modelType, model)
 	})
+}
+
+// pinPreferredModelLocked records a model choice made in this instance so
+// that a later config reload cannot replace it with a choice made
+// somewhere else. Several Crush instances share one global config file, so
+// a reload triggered by an unrelated write (a token refresh, say) would
+// otherwise import whichever model a sibling instance last selected and
+// switch models out from under the user mid-session.
+//
+// Caller must hold writeMu.
+func (s *ConfigStore) pinPreferredModelLocked(modelType SelectedModelType, model SelectedModel) {
+	if s.overrides.Models == nil {
+		s.overrides.Models = make(map[SelectedModelType]SelectedModel)
+	}
+	s.overrides.Models[modelType] = model
 }
 
 // RemoveConfigField removes a key from the config file for the given scope.
@@ -413,12 +526,13 @@ func (s *ConfigStore) UpdatePreferredModel(scope Scope, modelType SelectedModelT
 
 // updatePreferredModelFields builds the fields map for persisting a preferred
 // model change. Shared between UpdatePreferredModel and direct updateLocked
-// callers (e.g. Load).
+// callers (e.g. Load). Caller must hold writeMu.
 func (s *ConfigStore) updatePreferredModelFields(c *Config, modelType SelectedModelType, model SelectedModel) map[string]any {
 	if c.Models == nil {
 		c.Models = make(map[SelectedModelType]SelectedModel)
 	}
 	c.Models[modelType] = model
+	s.pinPreferredModelLocked(modelType, model)
 
 	fields := map[string]any{
 		fmt.Sprintf("models.%s", modelType): model,
@@ -450,29 +564,71 @@ func (s *ConfigStore) SetTransparentBackground(scope Scope, enabled bool) error 
 }
 
 // SetProviderAPIKey sets the API key for a provider and persists it.
+// The OpenAI provider holds exactly one credential: storing a ChatGPT
+// token removes a previously entered API key, and storing an API key
+// removes a previous ChatGPT login.
 func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey any) error {
 	var providerConfig ProviderConfig
 	var exists bool
 	var setKeyOrToken func()
+	isToken := false
 
 	switch v := apiKey.(type) {
 	case string:
 		if err := s.SetConfigField(scope, fmt.Sprintf("providers.%s.api_key", providerID), v); err != nil {
 			return fmt.Errorf("failed to save api key to config file: %w", err)
 		}
-		setKeyOrToken = func() { providerConfig.APIKey = v }
+		setKeyOrToken = func() {
+			providerConfig.APIKey = v
+			if providerID == string(catwalk.InferenceProviderOpenAI) {
+				// Either OAuth or an API key, never both: the login
+				// leaves nothing usable on the API-key side behind.
+				providerConfig.OAuthToken = nil
+				providerConfig.ChatGPTModels = nil
+			}
+		}
+		if providerID == string(catwalk.InferenceProviderOpenAI) {
+			// Either OAuth or an API key, never both: the new key
+			// leaves nothing usable on the ChatGPT side behind.
+			if err := s.RemoveConfigField(scope, fmt.Sprintf("providers.%s.oauth", providerID)); err != nil {
+				return err
+			}
+			if err := s.RemoveConfigField(scope, fmt.Sprintf("providers.%s.chatgpt_models", providerID)); err != nil {
+				return err
+			}
+		}
 	case *oauth.Token:
-		if err := s.SetConfigFields(scope, map[string]any{
-			fmt.Sprintf("providers.%s.api_key", providerID): v.AccessToken,
-			fmt.Sprintf("providers.%s.oauth", providerID):   v,
+		// Hold the refresh lock across the write so a peer's in-flight
+		// token exchange cannot land on top of a credential the user just
+		// obtained interactively — which would silently invalidate the
+		// login they only just completed.
+		fields := map[string]any{
+			fmt.Sprintf("providers.%s.oauth", providerID): v,
+		}
+		if providerID != string(catwalk.InferenceProviderOpenAI) {
+			fields[fmt.Sprintf("providers.%s.api_key", providerID)] = v.AccessToken
+		}
+		if err := s.withRefreshLock(providerID, func() error {
+			return s.SetConfigFields(scope, fields)
 		}); err != nil {
 			return err
 		}
+		if providerID == string(catwalk.InferenceProviderOpenAI) {
+			// Either OAuth or an API key, never both: the login retires
+			// any key that came before it.
+			if err := s.RemoveConfigField(scope, fmt.Sprintf("providers.%s.api_key", providerID)); err != nil {
+				return err
+			}
+		}
 		setKeyOrToken = func() {
-			providerConfig.APIKey = v.AccessToken
 			providerConfig.OAuthToken = v
-			switch providerID {
-			case string(catwalk.InferenceProviderCopilot):
+			if providerID == string(catwalk.InferenceProviderOpenAI) {
+				isToken = true
+				providerConfig.APIKey = ""
+				return
+			}
+			providerConfig.APIKey = v.AccessToken
+			if providerID == string(catwalk.InferenceProviderCopilot) {
 				providerConfig.SetupGitHubCopilot()
 			}
 		}
@@ -483,34 +639,108 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	if exists {
 		setKeyOrToken()
 		cfg.Providers.Set(providerID, providerConfig)
-		return nil
-	}
-
-	var foundProvider *catwalk.Provider
-	for _, p := range s.knownProviders {
-		if string(p.ID) == providerID {
-			foundProvider = &p
-			break
-		}
-	}
-
-	if foundProvider != nil {
-		providerConfig = ProviderConfig{
-			ID:           providerID,
-			Name:         foundProvider.Name,
-			BaseURL:      foundProvider.APIEndpoint,
-			Type:         foundProvider.Type,
-			Disable:      false,
-			ExtraHeaders: make(map[string]string),
-			ExtraParams:  make(map[string]string),
-			Models:       foundProvider.Models,
-		}
-		setKeyOrToken()
 	} else {
-		return fmt.Errorf("provider with ID %s not found in known providers", providerID)
+		var foundProvider *catwalk.Provider
+		for _, p := range s.knownProviders {
+			if string(p.ID) == providerID {
+				foundProvider = &p
+				break
+			}
+		}
+
+		if foundProvider != nil {
+			providerConfig = ProviderConfig{
+				ID:           providerID,
+				Name:         foundProvider.Name,
+				BaseURL:      foundProvider.APIEndpoint,
+				Type:         foundProvider.Type,
+				Disable:      false,
+				ExtraHeaders: make(map[string]string),
+				ExtraParams:  make(map[string]string),
+				Models:       foundProvider.Models,
+			}
+			setKeyOrToken()
+		} else {
+			return fmt.Errorf("provider with ID %s not found in known providers", providerID)
+		}
+		cfg.Providers.Set(providerID, providerConfig)
 	}
-	cfg.Providers.Set(providerID, providerConfig)
+
+	// After authenticating with Hyper, re-fetch the provider catalog so
+	// the latest models are available without restarting.
+	if providerID == "hyper" {
+		if refetchErr := s.RefetchHyperProvider(context.Background()); refetchErr != nil {
+			slog.Warn("Failed to refetch Hyper provider after auth", "error", refetchErr)
+		}
+	}
+	// After authenticating with a ChatGPT account, fetch the Codex model
+	// catalog the subscription grants and persist it so the models
+	// dialog can offer it beside the API-key catalog.
+	if providerID == string(catwalk.InferenceProviderOpenAI) && isToken {
+		s.refetchOpenAIModels(context.Background(), scope)
+	}
 	return nil
+}
+
+// fetchOpenAIModels fetches the ChatGPT model catalog from the Codex
+// backend. A package variable so tests can stub the network call,
+// matching how the catwalk and hyper syncers are swappable globals.
+var fetchOpenAIModels = openai.Models
+
+// refetchOpenAIModels stores the Codex model catalog the ChatGPT plan
+// grants next to the provider's API-key models. Best effort: a failure
+// leaves the existing catalog in place and the login still succeeds.
+func (s *ConfigStore) refetchOpenAIModels(ctx context.Context, scope Scope) {
+	const providerID = string(catwalk.InferenceProviderOpenAI)
+	pc, ok := s.Config().Providers.Get(providerID)
+	if !ok || pc.OAuthToken == nil {
+		return
+	}
+	// The access token may have expired since login, so renew it before
+	// asking for the catalog: the models endpoint rejects stale tokens
+	// with a 401. A failed refresh falls through and lets the fetch run
+	// on the old token, which keeps the existing catalog in place.
+	if pc.OAuthToken.IsExpired() {
+		if err := s.RefreshOAuthToken(ctx, scope, providerID); err != nil {
+			slog.Warn("Failed to refresh the ChatGPT token before fetching the model catalog", "error", err)
+		}
+		if refreshed, ok := s.Config().Providers.Get(providerID); ok && refreshed.OAuthToken != nil {
+			pc = refreshed
+		}
+	}
+	models, err := fetchOpenAIModels(ctx, pc.OAuthToken)
+	if err != nil {
+		slog.Warn("Failed to fetch ChatGPT model catalog after auth", "error", err)
+		return
+	}
+	if err := s.update(scope, func(c *Config) map[string]any {
+		p, ok := c.Providers.Get(providerID)
+		if !ok {
+			return nil
+		}
+		p.ChatGPTModels = models
+		c.Providers.Set(providerID, p)
+		return map[string]any{
+			"providers.openai.chatgpt_models": models,
+		}
+	}); err != nil {
+		slog.Warn("Failed to persist ChatGPT model catalog", "error", err)
+	}
+}
+
+// RefetchOpenAIChatGPTModels fills in the ChatGPT model catalog when the
+// OpenAI provider is signed in but has none — because the fetch at login
+// time failed, or the credentials predate the catalog. A no-op once the
+// catalog exists, so callers can invoke it freely on model updates: an
+// existing catalog is refreshed at startup instead, when Catwalk delivers
+// a new one (see Load).
+func (s *ConfigStore) RefetchOpenAIChatGPTModels(ctx context.Context) {
+	cfg := s.Config()
+	pc, ok := cfg.Providers.Get(string(catwalk.InferenceProviderOpenAI))
+	if !ok || pc.OAuthToken == nil || len(pc.ChatGPTModels) > 0 {
+		return
+	}
+	s.refetchOpenAIModels(ctx, ScopeGlobal)
 }
 
 // RefreshOAuthToken refreshes the OAuth token for the given provider.
@@ -567,7 +797,7 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 		// Could not acquire the lock (peer wedged or deadline hit). Prefer a
 		// usable token already on disk over forcing our own exchange, which
 		// would risk reusing a rotated refresh token.
-		if diskToken := s.adoptableDiskToken(scope, providerID, entryToken); diskToken != nil {
+		if diskToken := s.usableDiskToken(scope, providerID, entryToken); diskToken != nil {
 			slog.Warn("Refresh lock unavailable; adopting token from disk", "provider", providerID, "error", lockErr)
 			return s.applyToken(providerConfig, diskToken, providerID)
 		}
@@ -575,58 +805,169 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 	}
 	defer release()
 
-	// Did a peer rotate the token while we waited for the lock? If disk now
-	// holds a different, unexpired token, adopt it instead of exchanging.
-	if diskToken := s.adoptableDiskToken(scope, providerID, entryToken); diskToken != nil {
-		slog.Info("Adopting token refreshed by another session", "provider", providerID)
-		return s.applyToken(providerConfig, diskToken, providerID)
+	// Now that we hold the lock, disk is the authority on which credential
+	// is current: a peer may have rotated ours away while we waited. Adopt
+	// a newer token outright when it is still usable, and otherwise switch
+	// to its refresh token for the exchange below. Presenting our own
+	// already-rotated refresh token would trip the provider's reuse
+	// detection and revoke the whole family, forcing an interactive login.
+	if diskToken := s.newerDiskToken(scope, providerID, entryToken); diskToken != nil {
+		if !diskToken.IsExpired() {
+			slog.Info("Adopting token refreshed by another session", "provider", providerID)
+			return s.applyToken(providerConfig, diskToken, providerID)
+		}
+		slog.Info("Exchanging with refresh token rotated by another session", "provider", providerID)
+		entryToken = diskToken
 	}
 
-	// Disk still holds our token (or no usable peer token exists) and we hold
+	// Disk still holds our token (or no newer peer token exists) and we hold
 	// the lock, so we are the sole exchanger. Perform the exchange.
 	refreshedToken, refreshErr := s.exchange(ctx, providerID, entryToken.RefreshToken)
 	if refreshErr != nil {
 		// The exchange may have failed because a peer rotated the refresh
-		// token in a window we did not cover. Re-check disk and adopt.
-		if diskToken := s.adoptableDiskToken(scope, providerID, entryToken); diskToken != nil {
-			slog.Info("Adopting token refreshed by another session after exchange failure", "provider", providerID)
-			return s.applyToken(providerConfig, diskToken, providerID)
+		// token in a window we did not cover. Re-check disk: adopt a usable
+		// token, or retry once with the peer's newer refresh token.
+		if diskToken := s.newerDiskToken(scope, providerID, entryToken); diskToken != nil {
+			if !diskToken.IsExpired() {
+				slog.Info("Adopting token refreshed by another session after exchange failure", "provider", providerID)
+				return s.applyToken(providerConfig, diskToken, providerID)
+			}
+			slog.Info("Retrying exchange with refresh token rotated by another session", "provider", providerID)
+			refreshedToken, refreshErr = s.exchange(ctx, providerID, diskToken.RefreshToken)
 		}
+	}
+	if refreshErr != nil {
 		return fmt.Errorf("failed to refresh OAuth token for provider %s: %w", providerID, refreshErr)
 	}
 
 	slog.Info("Successfully refreshed OAuth token", "provider", providerID)
-	providerConfig.OAuthToken = refreshedToken
-	providerConfig.APIKey = refreshedToken.AccessToken
-	if providerID == string(catwalk.InferenceProviderCopilot) {
-		providerConfig.SetupGitHubCopilot()
+	if err := s.applyToken(providerConfig, refreshedToken, providerID); err != nil {
+		return err
 	}
-	cfg.Providers.Set(providerID, providerConfig)
 
-	if err := s.SetConfigFields(scope, map[string]any{
-		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
-		fmt.Sprintf("providers.%s.oauth", providerID):   refreshedToken,
-	}); err != nil {
+	if err := s.SetConfigFields(scope, tokenFields(providerID, refreshedToken)); err != nil {
 		return fmt.Errorf("failed to persist refreshed token: %w", err)
 	}
 	return nil
 }
 
-// adoptableDiskToken returns the on-disk token for the provider when it is
-// usable and differs from entryToken — i.e. when another session has
-// already refreshed it and we should adopt that result rather than running
-// our own exchange. It returns nil when there is nothing newer to adopt.
-func (s *ConfigStore) adoptableDiskToken(scope Scope, providerID string, entryToken *oauth.Token) *oauth.Token {
+// tokenFields builds the config fields that persist an OAuth token. The
+// OpenAI provider does not mirror the access token into api_key so a
+// manually entered API key can coexist with the ChatGPT login.
+func tokenFields(providerID string, token *oauth.Token) map[string]any {
+	fields := map[string]any{
+		fmt.Sprintf("providers.%s.oauth", providerID): token,
+	}
+	if providerID != string(catwalk.InferenceProviderOpenAI) {
+		fields[fmt.Sprintf("providers.%s.api_key", providerID)] = token.AccessToken
+	}
+	return fields
+}
+
+// WaitForTokenChange blocks until SignalAuthComplete is called for the
+// given provider or the context is cancelled. It is used by OnAuthRefresh
+// callbacks to wait for interactive re-authentication to complete before
+// retrying a failed request. The channel is created atomically with the
+// wait registration so a concurrent SignalAuthComplete cannot miss it.
+func (s *ConfigStore) WaitForTokenChange(ctx context.Context, providerID string) error {
+	s.authSignalMu.Lock()
+	ch, ok := s.authSignals[providerID]
+	if !ok {
+		ch = make(chan struct{})
+		if s.authSignals == nil {
+			s.authSignals = make(map[string]chan struct{})
+		}
+		s.authSignals[providerID] = ch
+	}
+	s.authSignalMu.Unlock()
+
+	select {
+	case <-ch:
+		// Remove the consumed signal so a subsequent
+		// SignalAuthComplete does not close an already-closed
+		// channel.
+		s.authSignalMu.Lock()
+		if s.authSignals[providerID] == ch {
+			delete(s.authSignals, providerID)
+		}
+		s.authSignalMu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// SignalAuthComplete unblocks any goroutine waiting in WaitForTokenChange
+// for the given provider. If no waiter exists yet, it pre-creates and
+// immediately closes the channel so a subsequent WaitForTokenChange
+// returns without blocking. This eliminates the race where the signal
+// fires before the waiter registers.
+func (s *ConfigStore) SignalAuthComplete(providerID string) {
+	s.authSignalMu.Lock()
+	defer s.authSignalMu.Unlock()
+	if ch, ok := s.authSignals[providerID]; ok {
+		delete(s.authSignals, providerID)
+		select {
+		case <-ch:
+			// Already closed by a previous signal; nothing to do.
+		default:
+			close(ch)
+		}
+	} else {
+		// No waiter yet. Pre-create a closed channel so the next
+		// WaitForTokenChange returns immediately.
+		if s.authSignals == nil {
+			s.authSignals = make(map[string]chan struct{})
+		}
+		ch := make(chan struct{})
+		close(ch)
+		s.authSignals[providerID] = ch
+	}
+}
+
+// newerDiskToken returns the on-disk token for the provider when it is
+// newer than entryToken — i.e. another session (possibly in another
+// process) has already rotated the credential. It returns nil when disk
+// holds nothing newer than what we started with.
+//
+// Newness is judged by expiry as well as identity, so a config file that
+// somehow holds an older token cannot drag us backwards. The result may
+// itself be expired: providers that rotate refresh tokens invalidate ours
+// the moment a peer refreshes, so the peer's refresh token is the only one
+// the provider will still accept even after its access token ages out.
+// Callers decide whether to adopt the token wholesale or merely borrow its
+// refresh token.
+func (s *ConfigStore) newerDiskToken(scope Scope, providerID string, entryToken *oauth.Token) *oauth.Token {
 	diskToken, err := s.loadTokenFromDisk(scope, providerID)
 	if err != nil {
 		slog.Warn("Failed to read token from config file", "provider", providerID, "error", err)
 		return nil
 	}
-	if diskToken == nil || diskToken.IsExpired() {
+	if diskToken == nil {
 		return nil
 	}
 	if diskToken.AccessToken == entryToken.AccessToken {
-		// Same token we started with; nobody refreshed since.
+		// Same token we started with; nobody rotated since.
+		return nil
+	}
+	if diskToken.RefreshToken == "" && entryToken.RefreshToken != "" {
+		// Adopting would strand us with no way to refresh later, and
+		// there is nothing to borrow for an exchange.
+		return nil
+	}
+	if diskToken.ExpiresAt < entryToken.ExpiresAt {
+		// Older than ours; nothing to gain from adopting it.
+		return nil
+	}
+	return diskToken
+}
+
+// usableDiskToken returns the on-disk token only when it is both newer
+// than entryToken and still valid, meaning it can be adopted as-is with
+// no exchange at all.
+func (s *ConfigStore) usableDiskToken(scope Scope, providerID string, entryToken *oauth.Token) *oauth.Token {
+	diskToken := s.newerDiskToken(scope, providerID, entryToken)
+	if diskToken == nil || diskToken.IsExpired() {
 		return nil
 	}
 	return diskToken
@@ -642,11 +983,30 @@ func (s *ConfigStore) exchange(ctx context.Context, providerID, refreshToken str
 	switch providerID {
 	case string(catwalk.InferenceProviderCopilot):
 		return copilot.RefreshToken(ctx, refreshToken)
+	case string(catwalk.InferenceProviderOpenAI):
+		return openai.RefreshToken(ctx, refreshToken)
 	case hyperp.Name:
 		return hyper.ExchangeToken(ctx, refreshToken)
 	default:
 		return nil, fmt.Errorf("OAuth refresh not supported for provider %s", providerID)
 	}
+}
+
+// withRefreshLock runs fn while holding the per-provider cross-process
+// refresh lock, so a credential write cannot interleave with a peer's
+// token exchange. Acquisition is best effort: when the lock cannot be
+// taken in time, fn runs anyway rather than blocking a write the user is
+// waiting on.
+func (s *ConfigStore) withRefreshLock(providerID string, fn func() error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), credentialWriteLockDeadline)
+	defer cancel()
+	release, err := lock.File(ctx, s.refreshLockPath(providerID))
+	if err != nil {
+		slog.Warn("Writing credentials without the refresh lock", "provider", providerID, "error", err)
+		return fn()
+	}
+	defer release()
+	return fn()
 }
 
 // refreshLockPath returns the path to the per-provider cross-process refresh
@@ -663,7 +1023,11 @@ func (s *ConfigStore) refreshLockPath(providerID string) string {
 // applyToken updates the in-memory provider config with the given token.
 func (s *ConfigStore) applyToken(providerConfig ProviderConfig, token *oauth.Token, providerID string) error {
 	providerConfig.OAuthToken = token
-	providerConfig.APIKey = token.AccessToken
+	// The OpenAI provider holds exactly one credential, so a ChatGPT
+	// token means there is no API key side by side with it.
+	if providerID != string(catwalk.InferenceProviderOpenAI) {
+		providerConfig.APIKey = token.AccessToken
+	}
 	if providerID == string(catwalk.InferenceProviderCopilot) {
 		providerConfig.SetupGitHubCopilot()
 	}
@@ -747,6 +1111,7 @@ func NewTestStore(cfg *Config, loadedPaths ...string) *ConfigStore {
 	return &ConfigStore{
 		config:      cfg,
 		loadedPaths: loadedPaths,
+		resolver:    NewShellVariableResolver(env.New()),
 	}
 }
 
@@ -935,7 +1300,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	migrateDisableNotifications()
 
 	configPaths := lookupConfigs(s.workingDir)
-	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
+	cfg, loadedPaths, err := loadFromConfigPaths(ctx, configPaths)
 	if err != nil {
 		return fmt.Errorf("failed to reload config: %w", err)
 	}
@@ -962,7 +1327,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		}
 	}
 
-	// Preserve runtime overrides.
+	// Reapply startup-only provider and model settings after loading files.
 	overrides := s.overrides
 	if err := cfg.applyRuntimeOverrides(overrides); err != nil {
 		return err
@@ -974,25 +1339,43 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("invalid hook configuration on reload: %w", err)
 	}
 
-	// Reconfigure providers
-	env := env.New()
-	resolver := NewShellVariableResolver(env)
-	providers, err := Providers(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to load providers during reload: %w", err)
-	}
-
-	if err := cfg.configureProviders(ctx, s, env, resolver, providers); err != nil {
-		return fmt.Errorf("failed to configure providers during reload: %w", err)
-	}
-
-	// Save current state for potential rollback
+	// Save current state for potential rollback BEFORE configureProviders,
+	// which may write to disk via RemoveConfigField (e.g. removing stale
+	// OAuth providers). Capturing after would snapshot a config that has
+	// already been mutated, and the rollback would restore corrupted state.
 	oldConfig := s.Config()
 	oldLoadedPaths := s.loadedPaths
 	oldResolver := s.resolver
 	oldKnownProviders := s.knownProviders
 	oldOverrides := s.overrides
 	oldWorkspacePath := s.workspacePath
+
+	// Reapply model choices made in this instance. The global config file is
+	// shared, so it may now name a model a sibling instance selected; a
+	// reload triggered by an unrelated write must not swap the user's model
+	// mid-session. An external edit to the config still takes effect for any
+	// model type this instance never chose.
+	maps.Copy(cfg.Models, overrides.Models)
+
+	// Reconfigure providers
+	env := env.New()
+	resolver := NewShellVariableResolver(env)
+
+	// Apply top-level env vars before configuring providers so variables
+	// like AWS_PROFILE are visible to the AWS SDK credential chain.
+	cfg.applyEnv(resolver)
+
+	providers, err := Providers(cfg)
+	if err != nil {
+		if len(providers) == 0 {
+			return fmt.Errorf("failed to load providers during reload: %w", err)
+		}
+		slog.Warn("Reload continuing with the previously known providers", "error", err)
+	}
+
+	if err := cfg.configureProviders(ctx, s, env, resolver, providers); err != nil {
+		return fmt.Errorf("failed to configure providers during reload: %w", err)
+	}
 
 	// Update store state BEFORE running model/agent setup (so they see new config)
 	s.setConfig(cfg)
@@ -1028,8 +1411,10 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return setupErr
 	}
 
-	// Rebuild staleness tracking
-	s.captureStalenessSnapshot(loadedPaths)
+	// Rebuild staleness tracking. Track every discovered config path, not
+	// just the ones that loaded, so a config file created after this reload
+	// is detected as a change on the next staleness check.
+	s.captureStalenessSnapshot(append(slices.Clone(configPaths), loadedPaths...))
 
 	return nil
 }
